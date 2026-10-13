@@ -100,7 +100,7 @@ The checks:
 5. Shallow git clone (`GIT_DEPTH` 1-20)
 6. Test workers capped to runner vCPUs (`--maxWorkers`, `-n`, `-p`, `--workers`)
 7. Runtime heap ceiling, summed over a job's processes, <= 75% of runner RAM (`NODE_OPTIONS`, `GOMEMLIMIT`)
-8. Dependencies installed in one job only
+8. Dependencies installed once and shared (one `install` job, artifacts, `needs:`)
 9. No tool installs at job time (prebuilt CI image)
 10. Every test or trigger job on the push path skips untouched code (`rules: changes:`)
 11. E2E and security scans off the push path (`schedule` or `manual`)

@@ -70,7 +70,7 @@ class AuditTest(unittest.TestCase):
 
     def test_root_copy_matches_the_packaged_skill(self):
         root = SKILL.parent.parent
-        for path in sorted(p for p in SKILL.rglob("*") if p.is_file()):
+        for path in sorted(p for p in SKILL.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
             with self.subTest(str(path.relative_to(SKILL))):
                 self.assertEqual((root / path.relative_to(SKILL)).read_bytes(), path.read_bytes())
 
@@ -84,6 +84,29 @@ class AuditTest(unittest.TestCase):
         override = '    NODE_OPTIONS: "--max-old-space-size=512"\n'
         self.assertIn(override, NODE)
         self.assertEqual(failed(NODE.replace(override, "")), {"heap_capping"})  # 1536 MB x (2 workers + parent)
+
+    def test_zero_is_not_a_heap_cap(self):
+        self.assertEqual(failed(NODE.replace("--max-old-space-size=1536", "--max-old-space-size=0")), {"heap_capping"})
+
+    def test_package_manager_test_command_is_an_uncapped_runner(self):
+        jest = "- npx jest --maxWorkers=2 --workerIdleMemoryLimit=512MB --shard=$CI_NODE_INDEX/$CI_NODE_TOTAL"
+        self.assertIn(jest, NODE)
+        self.assertEqual(failed(NODE.replace(jest, "- npm test")), {"worker_capping"})
+        self.assertEqual(failed(NODE.replace(jest, "- npm test -- --maxWorkers=2")), set())
+
+    def test_never_must_sit_on_the_open_merge_request_rule(self):
+        dedup = "    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS\n      when: never\n"
+        tags = "    - if: $CI_COMMIT_TAG\n"
+        self.assertIn(dedup, NODE)
+        self.assertIn(tags, NODE)
+        moved = NODE.replace(dedup, dedup.replace("      when: never\n", "")).replace(tags, tags + "      when: never\n")
+        self.assertEqual(failed(moved), {"one_pipeline_per_push"})
+
+    def test_install_inside_a_sharded_test_job_is_not_install_once(self):
+        sharded = "test:\n  parallel: 2\n  script:\n    - npm ci\n    - npx jest --maxWorkers=2\n"
+        self.assertIn("install_once", failed(sharded))
+        unshared = "deps:\n  script:\n    - npm ci\ntest:\n  script:\n    - npx jest --maxWorkers=2\n"
+        self.assertIn("install_once", failed(unshared))
 
     def test_catch_all_workflow_rule_allows_duplicate_pipelines(self):
         start, end = NODE.index("workflow:"), NODE.index("# 2. Pipeline Defaults")

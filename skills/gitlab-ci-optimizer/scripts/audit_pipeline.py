@@ -23,7 +23,9 @@ HEAP_FRACTION = 0.75
 UNIT_MINUTES = {"s": 1 / 60, "m": 1, "h": 60, "d": 1440, "w": 10080, "mo": 43200, "y": 525600}
 MIB = {"": 1 / 2**20, "b": 1 / 2**20, "k": 1 / 2**10, "m": 1, "g": 2**10}
 
-TEST_RUNNER = r"\b(?:jest|vitest|playwright test|pytest|go test)\b"
+# `npm test` hides which runner it starts, so it is held to the same worker flag as Jest.
+JEST_LIKE = r"\b(?:jest|vitest)\b|\b(?:npm|pnpm|yarn)(?: run)? test\b"
+TEST_RUNNER = JEST_LIKE + r"|\b(?:playwright test|pytest|go test)\b"
 NODE_STACK = r"\b(?:npm|npx|pnpm|yarn|node|jest|vitest)\b"
 INSTALL = r"\b(?:npm ci|npm install|npm i|pnpm install|yarn install|uv sync|pip install|poetry install|go mod download|bundle install)\b"
 TOOL_INSTALL = r"\b(?:apt-get|apt|apk|yum|dnf)\b[^|;&]*\b(?:install|add)\b|\bnpm (?:install|i) (?:-g|--global)\b|\bcurl\b.*\|\s*(?:ba)?sh\b"
@@ -59,13 +61,18 @@ def nested(body, key):
     return match.group(2) if match else ""
 
 
+def rule_items(body):
+    """Each entry of the `rules:` list in a block."""
+    rules = nested(body, "rules")
+    indent = re.match(r"\s*", rules).group()
+    return re.split(rf"^{indent}- ", rules, flags=re.M)[1:]
+
+
 def off_push_path(body):
     """True when no rule lets a push start the job: every rule is a schedule, manual or never."""
-    rules = nested(body, "rules")
-    if not rules.strip():
+    items = rule_items(body)
+    if not items:
         return bool(re.search(r"^\s+when:\s*manual", body, re.M))
-    indent = re.match(r"\s*", rules).group()
-    items = re.split(rf"^{indent}- ", rules, flags=re.M)[1:]
     return all(re.search(r"CI_PIPELINE_SOURCE\s*==\s*['\"]schedule['\"]|when:\s*(?:manual|never)", item) for item in items)
 
 
@@ -82,13 +89,13 @@ def heap_over_budget(name, body, variables, max_workers, heap_limit):
 
     checks = []
     if re.search(NODE_STACK, body):
-        processes = count(r"(?:--maxWorkers|max(?:Forks|Threads)|-w)[= ](\S+)") + 1 if re.search(r"\b(?:jest|vitest)\b", body) else 1
+        processes = count(r"(?:--maxWorkers|max(?:Forks|Threads)|-w)[= ](\S+)") + 1 if re.search(JEST_LIKE, body) else 1
         checks.append(("--max-old-space-size", cap(r"--max-old-space-size=(\d+)()"), processes))
     if re.search(r"\bgo (?:test|build)\b", body):
         processes = count(r"(?<!\S)-p[= ](\S+)") if re.search(r"\bgo test\b", body) else 1
         checks.append(("GOMEMLIMIT", cap(r"GOMEMLIMIT[:=]\s*['\"]?(\d+(?:\.\d+)?)([KMG]?)i?B?\b", lambda n, u: float(n) * MIB[u.lower()]), processes))
     for flag, mb, processes in checks:
-        if mb is None:
+        if not mb:  # absent, or 0, which Node and Go read as "no limit"
             return f"{name}: no {flag}"
         if mb * processes > heap_limit:
             return f"{name}: {flag} {mb:.0f} MB x {processes} processes"
@@ -103,8 +110,8 @@ def uncapped_runner(line, max_workers):
             return required
         return not cap.group(1).isdigit() or not 1 <= int(cap.group(1)) <= max_workers
 
-    if re.search(r"\b(?:jest|vitest)\b", line) and over(r"(?:--maxWorkers|max(?:Forks|Threads)|-w)[= ](\S+)", True):
-        return f"jest/vitest needs --maxWorkers={max_workers}"
+    if re.search(JEST_LIKE, line) and over(r"(?:--maxWorkers|max(?:Forks|Threads)|-w)[= ](\S+)", True):
+        return f"jest/vitest (or an npm test script) needs --maxWorkers={max_workers} on the command line"
     if re.search(r"\bplaywright test\b", line) and over(r"--workers[= ](\S+)", True):
         return f"playwright needs --workers={max_workers} or fewer"
     if re.search(r"\bgo test\b", line) and over(r"(?<!\S)-p[= ](\S+)", True):
@@ -132,7 +139,7 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
     def check(key, title, ok, passed, fix):
         checks[key] = {"ok": ok, "title": title, "detail": "Not applicable to this pipeline." if ok is None else passed if ok else fix}
 
-    dedup = "CI_OPEN_MERGE_REQUESTS" in workflow and re.search(r"when:\s*never", workflow)
+    dedup = any("CI_OPEN_MERGE_REQUESTS" in item and re.search(r"when:\s*never", item) for item in rule_items(workflow))
     # Only merge request pipelines or only branch pipelines, with no catch-all rule that admits the other.
     catch_all = re.search(r"^\s*- when:\s*(?:always|on_success|manual|delayed)", workflow, re.M)
     one_source = ("merge_request_event" in workflow) != ("CI_COMMIT_BRANCH" in workflow) and not catch_all
@@ -182,10 +189,17 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
           f"Over the {heap_limit:.0f} MB budget or uncapped: {'; '.join(over)}. Divide the ceiling by the processes the job runs.")
 
     installs = [line.strip() for line in text.splitlines() if re.search(INSTALL, line)]
-    check("install_once", "Dependencies installed in one job only",
-          None if not installs else len(installs) == 1,
-          "One install command; other jobs receive dependencies through needs:.",
-          f"{len(installs)} install commands found. Keep one `install` job, pass its output as artifacts, and use `needs: [install]`.")
+    installers = [name for name, body in jobs.items() if re.search(INSTALL, body)]
+    script_jobs = [name for name, body in jobs.items() if re.search(r"^\s+script:", body, re.M)]
+    shared = False
+    if len(installs) == 1 and len(installers) == 1 and not re.search(r"^\s+parallel:", jobs[installers[0]], re.M):
+        producer = re.escape(installers[0])
+        consumed = any(re.search(rf"^\s+needs:.*\b{producer}\b|^\s+- (?:job: )?{producer}\s*$", jobs[name], re.M) for name in script_jobs)
+        shared = len(script_jobs) == 1 or bool(re.search(r"^\s+artifacts:", jobs[installers[0]], re.M) and consumed)
+    check("install_once", "Dependencies installed once and shared (install job, artifacts, needs:)",
+          None if not installs else shared,
+          "One install job; other jobs receive its artifact through needs:.",
+          f"{len(installs)} install commands in jobs {', '.join(installers) or '(none)'}. Keep one unsharded `install` job, export its output as artifacts, and use `needs: [install]` in the jobs that consume it.")
 
     tool_installs = [line.strip() for line in text.splitlines() if re.search(TOOL_INSTALL, line)]
     check("prebuilt_ci_image", "No tool installs at job time (prebuilt CI image)",
