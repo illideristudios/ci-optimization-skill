@@ -1,35 +1,33 @@
 ---
 name: gitlab-ci-optimizer
 description: >-
-  Use this skill to design, audit, debug, or optimize GitLab CI/CD pipelines (.gitlab-ci.yml).
-  Applies proven patterns from the Gauntlet GitLab Primer and industry best practices: eliminates
-  OOM kills (exit 137), caps workers/heap to runner specs, eliminates the 3 setup taxes (prebuilt
-  CI image + install-once artifact sync), optimizes DAG dependencies (needs), prevents duplicate
-  merge request pipelines (workflow:rules), configures fast artifact expiration, and shards test
-  suites with parallel.
+  Use when creating, editing, reviewing, or debugging a GitLab CI/CD pipeline (.gitlab-ci.yml or
+  Dockerfile.ci), or when a CI job fails with exit 137, "Killed", or heap out of memory. Covers
+  worker and heap caps sized to the runner, the prebuilt CI image, install-once artifacts, DAG
+  dependencies (needs), duplicate merge request pipelines (workflow:rules), artifact expiry, and
+  test sharding with parallel. Not for GitHub Actions or other CI systems.
 ---
 
 # GitLab CI Pipeline Optimizer
 
-This skill provides an authoritative field manual and automated toolkit for building lean, fast, and OOM-resilient GitLab CI/CD pipelines. It is derived from the **Gauntlet GitLab Primer** (`labs.gauntletai.com`) and production engineering best practices.
+Rules and tools for building lean, fast GitLab CI/CD pipelines that survive small runners. Derived from the [Gauntlet GitLab Primer](https://gitlab-primer.netlify.app/).
 
 ---
 
 ## Quick Diagnostic & Helper Tools
 
-When analyzing or modifying a project with `.gitlab-ci.yml`:
+Both scripts live in this skill's `scripts/` directory and need only Python 3. The commands below assume the skill is installed at `.agents/skills/gitlab-ci-optimizer/`; adjust the prefix if it lives elsewhere.
 
-1. **Audit an existing pipeline against the 11-point lean scorecard**:
+1. **Audit an existing pipeline against the 11-point lean checklist**:
    ```bash
    python3 .agents/skills/gitlab-ci-optimizer/scripts/audit_pipeline.py .gitlab-ci.yml
    ```
-2. **Simulate memory consumption and runner concurrency fit** (Available as slash command `/simulate-budget`):
+   Pass `--ram` and `--max-workers` when the runner is not 2048 MB / 2 vCPU. Exit code 0 means every applicable check passed, 1 means one failed, 2 means the file could not be audited.
+2. **Estimate memory and runner concurrency fit** (slash command `/simulate-budget`):
    ```bash
    python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py --stack node --ram 2048 --vcpus 2 --slots 2 --workers 2 --shards 2
    ```
-   > [!TIP]
-   > You or the user can type `/simulate-budget` directly in the chat to launch the interactive runner budget simulator.
-
+   The simulator does not read the pipeline. Its suite duration and per-worker memory are illustrative constants, so use it to compare configurations, not to predict a real job.
 
 ---
 
@@ -39,18 +37,20 @@ When analyzing or modifying a project with `.gitlab-ci.yml`:
 Every CI job pays up to three setup taxes before executing real work:
 * **Image Tax (Tools)**: Downloading bloated base images and installing OS packages (`apt-get`, `curl`, `jq`).
   * *Fix*: Bake tools into a minimal `Dockerfile.ci` pushed to `$CI_REGISTRY_IMAGE/ci:latest` in `.pre`.
-* **Install Tax (Dependencies)**: Resolving and downloading packages (`node_modules/`, `.venv/`, `.go/mod/`).
+* **Install Tax (Dependencies)**: Resolving and downloading packages (`node_modules/`, `.venv/`, `.go/pkg/mod/`).
   * *Fix*: **Install once, sync everywhere**. Run a single `install` job with lockfile caching, pass dependencies downstream via ephemeral artifacts (`expire_in: 1 hour`), and declare `needs: [install]`.
 * **Job Tax (Your Code)**: Linting, compiling, and testing. This is the **only** tax you should pay on each push.
 
 ### 2. The Six Memory & Runner Survival Rules
 Most pipeline failures on 1GB–4GB runner containers are not code bugs—they are **exit 137 OOM kills** caused by tools sized for multi-core laptops.
 1. **Know the Kill Signal**: Exit code 137 (`128 + 9 SIGKILL`), a bare `Killed` message, or `heap out of memory` means RAM starvation. Debug memory allocations first, not test logic.
-2. **Cap the Workers**: Containers inherit the host CPU count (e.g. 16 or 32 cores), leading tools to spawn dozens of workers on a 2-vCPU runner. Pin workers to runner vCPUs: `jest --maxWorkers=2`, `pytest -n 2`, `go test -p 2`.
-3. **Cap the Heap**: Set the runtime ceiling to **~75% of runner RAM**:
-   * Node: `NODE_OPTIONS="--max-old-space-size=1536"` (or `--workerIdleMemoryLimit=512MB`).
-   * Go: `GOMEMLIMIT="1500MiB"`.
+2. **Cap the Workers**: A container can report the host's CPU count (16 or 32 cores), so a tool that sizes its pool from it spawns far too many workers on a 2-vCPU runner. Cap workers at the runner's vCPUs (2 on Gauntlet runners): `jest --maxWorkers=2`, `pytest -n 2`, `go test -p 2`. Pytest is serial unless `pytest-xdist` is installed and `-n` is passed, so do not add `-n` to a suite that fits serially.
+3. **Cap the Heap**: The ceilings add up to **75% of runner RAM**, and each one applies **per process**, so divide by the number of processes the job runs. On a 2048 MB runner the budget is 1536 MB:
+   * Node, single process (lint, build): `NODE_OPTIONS="--max-old-space-size=1536"`.
+   * Node, Jest or Vitest with 2 workers (parent + 2 workers): `NODE_OPTIONS="--max-old-space-size=512"`. Jest's `--workerIdleMemoryLimit=512MB` recycles leaking workers; it is an addition to the cap, not a replacement.
+   * Go, `go test -p 2` (2 test binaries): `GOMEMLIMIT="768MiB"` with `GOMAXPROCS="2"`. The limit is soft.
    * JVM: `-XX:MaxRAMPercentage=75`.
+   * CPython has no heap cap. `MALLOC_ARENA_MAX="2"` limits glibc fragmentation; the worker cap is what bounds memory.
 4. **One Heavy Thing per Job**: Do not build, boot databases, and run full E2E suites inside a single job. Decouple jobs and pass artifacts forward using `needs:`.
 5. **Shard Anything Over ~8–10 Minutes**: Use `parallel: N` (e.g. `parallel: 2` or `4`). Split suites with Jest `--shard`, `pytest-split`, or Go package partitioning. **Always ensure `shards <= concurrent_runner_slots`** to prevent queuing in waves.
 6. **Don't Run What Didn't Change**: Use `rules: changes:` on lint and unit test jobs to skip execution when files outside that domain are modified.
@@ -62,7 +62,7 @@ Most pipeline failures on 1GB–4GB runner containers are not code bugs—they a
 Follow this procedure when reviewing or rewriting a pipeline:
 
 ### Step 1: Profiling Runner Boundaries
-Determine or ask for runner constraints:
+Find the runner constraints. If they are unknown and nobody can be asked, assume 2048 MB / 2 vCPU / 2 slots and say that you assumed it.
 * **RAM**: Typically 1024MB, 2048MB, or 4096MB.
 * **vCPUs**: Typically 2 vCPUs per job container.
 * **Concurrent Slots**: Total simultaneous jobs the runner fleet can execute.
@@ -77,10 +77,11 @@ In the root `.gitlab-ci.yml`:
        - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
          when: never
        - if: $CI_COMMIT_BRANCH
+       - if: $CI_COMMIT_TAG
    ```
-2. **Auto-Cancel Stale Runs**: Set `default: interruptible: true`.
-3. **Tighten Timeouts**: Set `default: timeout: 15m` (or `20m`) to prevent hung processes from consuming monthly runner quotas.
-4. **Shallow Clone**: Configure `variables: GIT_DEPTH: "20"`.
+2. **Auto-Cancel Stale Runs**: Set `default: interruptible: true`, and `interruptible: false` on every job that must not stop halfway: deploys, publishes, and the `ci-image` build.
+3. **Tighten Timeouts**: Set `default: timeout: 15m` so a hung process cannot consume the runner quota.
+4. **Shallow Clone**: Configure `variables: GIT_DEPTH: "20"`. New projects already default to 20 in their CI/CD settings; pinning it in the file covers older projects and changed settings.
 
 ### Step 3: Implement Install-Once & Caching Architecture
 Replace per-job `npm install` / `pip install` / `go mod download` with a dedicated `install` job:
@@ -91,9 +92,7 @@ Replace per-job `npm install` / `pip install` / `go mod download` with a dedicat
 
 ### Step 4: Tune Memory & Prevent OOM (Exit 137)
 * Ensure test runner workers match runner vCPUs (typically 2).
-* Export stack-appropriate heap cap in `variables:`.
-* For Node/Jest test suites, divide the memory ceiling by worker count:
-  `NODE_OPTIONS="--max-old-space-size=512"` with `--workerIdleMemoryLimit=512MB`.
+* Set the heap cap from rule 3 above in `variables:`, divided by the processes the job runs. Override it per job where the process count differs, as `test:unit` does in the Node example.
 
 ### Step 5: Convert Linear Stages to DAG (`needs:`)
 * Replace stage barriers with explicit job dependencies.
@@ -103,10 +102,10 @@ Replace per-job `npm install` / `pip install` / `go mod download` with a dedicat
 ### Step 6: Offload Heavy Suites from the Push Path
 * E2E tests (Playwright, Cypress, Selenium) and comprehensive security scanners (DAST/SAST) should be scheduled (`if: $CI_PIPELINE_SOURCE == "schedule"`) or made manual (`when: manual`, `allow_failure: true`).
 
-### Step 7: Validate & Measure
+### Step 7: Validate
 1. Run `python3 .agents/skills/gitlab-ci-optimizer/scripts/audit_pipeline.py .gitlab-ci.yml`.
-2. Ensure the Lean Score reaches >= 90/100.
-3. Validate GitLab CI syntax with the GitLab CI Lint API or `gitlab-ci-lint` CLI if installed.
+2. Treat each `FAIL` as a pointer to read that part of the YAML. The auditor matches text in one file and does not follow `include:`, `extends:` or anchors, so confirm a finding before changing the pipeline, and never add a job or keyword only to turn a check green.
+3. Validate the syntax with GitLab's CI Lint: `glab ci lint`, or the pipeline editor.
 
 ---
 
@@ -116,6 +115,8 @@ Replace per-job `npm install` / `pip install` / `go mod download` with a dedicat
 * **Python (uv & Pytest)**: See [python.gitlab-ci.yml](./examples/python.gitlab-ci.yml)
 * **Go (go mod & go test)**: See [go.gitlab-ci.yml](./examples/go.gitlab-ci.yml)
 * **Monorepo (Child Pipelines)**: See [monorepo.gitlab-ci.yml](./examples/monorepo.gitlab-ci.yml)
+
+Each template's header lists what must exist before its first run: a `Dockerfile.ci`, a privileged runner for the image build, and a protected `ci` container repository.
 
 ## Deep-Dive References
 

@@ -64,7 +64,7 @@ test:unit:
   parallel: 4
   needs: [install]
   script:
-    - npx vitest run --shard=$CI_NODE_INDEX/$CI_NODE_TOTAL
+    - npx vitest run --pool=forks --poolOptions.forks.maxForks=2 --shard=$CI_NODE_INDEX/$CI_NODE_TOTAL
 ```
 
 #### 3. Playwright E2E
@@ -74,11 +74,11 @@ test:e2e:
   parallel: 4
   needs: [build]
   script:
-    - npx playwright test --shard=$CI_NODE_INDEX/$CI_NODE_TOTAL
+    - npx playwright test --workers=2 --shard=$CI_NODE_INDEX/$CI_NODE_TOTAL
 ```
 
 #### 4. Python (Pytest with `pytest-split`)
-`pytest-split` uses previous timing data or test count to distribute test duration evenly across workers:
+`pytest-split` uses previous timing data (a committed `.test_durations` file) or, without it, test count to distribute tests across shards. `-n` needs `pytest-xdist`:
 ```yaml
 test:python:
   stage: test
@@ -94,8 +94,10 @@ Go does not have a native `--shard` flag, but packages can be partitioned cleanl
 test:go:
   stage: test
   parallel: 3
+  needs: [install]
   script:
     - PKGS=$(go list ./... | awk "NR % $CI_NODE_TOTAL == ($CI_NODE_INDEX - 1)")
+    - '[ -n "$PKGS" ] || { echo "no packages in this shard"; exit 0; }'
     - go test -p 2 -v $PKGS
 ```
 
@@ -126,6 +128,8 @@ When developers push multiple commits in quick succession, older running pipelin
 default:
   interruptible: true                # Automatically terminates running job when new commit is pushed
 ```
+
+Set `interruptible: false` on every job that must not stop halfway: deploys, publishes, and the `ci-image` build. A cancelled deploy is left half-applied, and a cancelled image build is never retried.
 
 ### 3. Skip Unchanged Code (`rules: changes:`)
 Don't run frontend tests when only Python backend files changed, and don't run tests on documentation updates:
@@ -163,12 +167,13 @@ e2e:
 ```
 
 ### 5. Concurrency Protection (`resource_group:`)
-Prevent race conditions and runner deadlocks when deploying:
+Stop two deployments from running at once:
 
 ```yaml
 deploy:production:
   stage: deploy
   resource_group: production        # Serializes jobs so only one deployment runs at a time
+  interruptible: false              # A new push must not cancel a deploy halfway
   script:
     - ./deploy.sh
 ```

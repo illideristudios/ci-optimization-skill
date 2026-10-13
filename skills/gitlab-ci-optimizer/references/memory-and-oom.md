@@ -16,9 +16,9 @@ When running inside Docker-based or Kubernetes GitLab Runners, jobs are subject 
 ## 2. The Host CPU & Concurrency Trap
 
 ### Why Uncapped Tools Blow Up Memory
-Inside a container allocated 2 vCPUs on a 16-core or 32-core host node, tools like Jest, Vitest, Pytest, Go, Cargo, or Make frequently query CPU count via `os.cpus()`, `nproc`, or `sysconf(_SC_NPROCESSORS_ONLN)`.
+Inside a container allocated 2 vCPUs on a 16-core or 32-core host node, tools that size a worker pool from the CPU count (`os.cpus()`, `nproc`, `sysconf(_SC_NPROCESSORS_ONLN)`) can see the host's cores instead of the container's. Jest, Vitest, `pytest -n auto`, Go before 1.25, Cargo and `make -j` all size themselves this way; newer runtimes increasingly read the cgroup limit, so check the version you run.
 
-- Default behavior: Spawns **N - 1 workers** (e.g. 15-31 worker processes).
+- Default behavior where the host count is used: **N - 1 workers** (e.g. 15-31 worker processes).
 - **Result**:
   1. Extreme CPU thrashing and context switching on the 2 assigned vCPUs.
   2. Each worker instantiates a full language runtime heap (e.g., 300MB - 600MB each).
@@ -62,12 +62,12 @@ Aim for the total runtime heap ceiling to occupy **~75% of runner container RAM*
    ```
 
 ### Python
-Python processes under `pytest-xdist` duplicate memory per fork/process.
-1. **Cap Pytest Workers**:
+Pytest runs in a single process unless `pytest-xdist` is installed and `-n` is passed, so a serial suite needs no cap and adding `-n 2` to it raises memory. Under `pytest-xdist` each worker is a full process.
+1. **Cap Pytest Workers** (when using `pytest-xdist`; never `-n auto`):
    ```bash
    uv run pytest -n 2
    ```
-2. **Prevent Buffer Inflation**:
+2. **Limit Allocator Fragmentation** (CPython has no heap cap; the worker cap is what bounds memory):
    ```yaml
    variables:
      PYTHONUNBUFFERED: "1"
@@ -75,14 +75,16 @@ Python processes under `pytest-xdist` duplicate memory per fork/process.
    ```
 
 ### Go
-Go 1.19+ introduced a soft memory limit that triggers GC before the kernel OOM killer steps in.
+Go 1.19+ introduced a soft memory limit that triggers GC before the kernel OOM killer steps in. It is soft, and it applies to each process: `go test -p 2` runs two test binaries, each with its own limit.
 1. **Soft Heap Limit**:
    ```yaml
    variables:
-     # Set to 75-80% of runner RAM
-     GOMEMLIMIT: "1500MiB"
+     # (Runner_RAM * 0.75) / test binaries: 1536 / 2 on a 2048MB runner with -p 2
+     GOMEMLIMIT: "768MiB"
+     # Before Go 1.25 the runtime sizes GOMAXPROCS to the host's cores, not the container's
+     GOMAXPROCS: "2"
    ```
-2. **Test Parallelism**:
+2. **Test Parallelism**: `-p` caps how many test binaries run at once; `t.Parallel()` tests inside one binary are capped by `-parallel`, which defaults to `GOMAXPROCS`.
    ```bash
    go test -p 2 ./...
    ```
@@ -116,7 +118,7 @@ Cargo and `rustc` with LTO (Link Time Optimization) or debug symbols can demand 
 
 | Observation | Root Cause | Immediate Remediation |
 | :--- | :--- | :--- |
-| `Job failed: exit code 137` during test suite | Runner container OOM killed | Reduce test workers to 2 (`--maxWorkers=2`, `-n 2`), set heap ceiling (`NODE_OPTIONS`, `GOMEMLIMIT`). |
+| `Job failed: exit code 137` during test suite | Runner container OOM killed | Reduce test workers to 2 (`--maxWorkers=2`, `-n 2`), set the per-process heap ceiling (`NODE_OPTIONS`, `GOMEMLIMIT`). Confirm with `cat /sys/fs/cgroup/memory.events` (`oom_kill` count) and `memory.peak` in an `after_script`. |
 | Exit 137 during `docker build` | Docker daemon or build step exceeded RAM | Avoid multi-stage builds on unprivileged small runners; prebuild tools in `Dockerfile.ci`. |
 | Memory climbs continuously until job crash | Memory leak across test files or uncapped worker cache | Add Jest `--workerIdleMemoryLimit=512MB`, or shard tests with `parallel: N`. |
 | Job runs 3x slower in CI than laptop despite high CPU usage | Worker count matches host CPU (e.g. 16) causing thrashing on 2 vCPUs | Explicitly pin workers to 2. |

@@ -4,7 +4,7 @@
 
 Every pipeline job pays up to three setup taxes before executing actual work:
 1. **The Image Tax (OS & Tools)**: Pulling bloated generic images, running `apt-get update`, installing system libraries (`git`, `curl`, `jq`, compilers, browser binaries).
-2. **The Install Tax (Dependencies)**: Downloading and resolving packages (`node_modules/`, `.venv/`, `.go/mod/`).
+2. **The Install Tax (Dependencies)**: Downloading and resolving packages (`node_modules/`, `.venv/`, `.go/pkg/mod/`).
 3. **The Job Tax (Your Work)**: Compiling, linting, executing tests, producing deployment bundles.
 
 > **Golden Principle**: The Job Tax is the **only** tax you should pay on every push. Image setup changes monthly; dependency installation changes weekly.
@@ -21,7 +21,7 @@ Instead of running package managers or installing tools in `before_script` on ev
 
 ```dockerfile
 # Dockerfile.ci - tools only, no app code or dependencies
-FROM node:20-slim
+FROM node:22-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ca-certificates curl jq \
  && rm -rf /var/lib/apt/lists/*
@@ -42,6 +42,8 @@ ci-image:
   image: docker:27
   services:
     - docker:27-dind                 # Requires privileged runner
+  interruptible: false               # A cancelled build is never retried: later pushes do not touch Dockerfile.ci
+  resource_group: ci-image           # One push of ci:latest at a time
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script: []                  # Clear any global before_script
@@ -54,6 +56,11 @@ ci-image:
       changes:
         - Dockerfile.ci
 ```
+
+### What this image job requires
+- **Bootstrap**: the first pipeline must be a push to the default branch that includes `Dockerfile.ci`. On any other ref `ci:latest` does not exist yet and every job fails on image pull. A change to `Dockerfile.ci` in a merge request is tested against the old image until it merges.
+- **A privileged runner**: docker-in-docker needs one. Give `ci-image` a dedicated runner; enabling privileged mode on a shared runner gives every branch pipeline root on the runner host.
+- **A protected container repository**: `ci:latest` is a mutable tag that every later pipeline runs in, and the `rules:` above are YAML a Developer can edit on their own branch. Add a container repository protection rule for `ci` with minimum push access Maintainer, and confirm on your GitLab version that it covers CI job tokens. Without it a Developer can replace the image that protected-branch pipelines, and their protected variables, run in.
 
 ---
 
@@ -111,6 +118,10 @@ test:
 | **Lifespan** | Long-term (weeks/months) | Ephemeral. Always configure `expire_in` (`1 hour` for deps, `1 day` for builds) |
 | **Optimal Policy** | `policy: pull-push` on install, `policy: pull` downstream | Passed via `needs: [job_name]` |
 
+Keep the project setting "Use separate caches for protected branches" on. With it off, a merge request pipeline can write a cache that a protected-branch pipeline later restores and runs.
+
+Install-once costs an artifact upload plus a download in every consuming job. It wins when installing is slow; with a warm cache and a very large `node_modules/` the transfer can cost more than the install it replaces, so measure before adopting it there.
+
 ---
 
 ## 5. Strict Lockfile Installation Matrix
@@ -124,7 +135,7 @@ Never use commands that mutate lockfiles in CI (e.g. bare `npm install`, `pip in
 | **yarn (Berry)** | `yarn install --immutable` | `.yarn/cache/` | `.yarn/` or `node_modules/` |
 | **Python (uv)** | `uv sync --frozen` | `.uv-cache/` | `.venv/` |
 | **Python (Poetry)**| `poetry install --no-root --sync` | `.cache/pypoetry` | `.venv/` |
-| **Go** | `go mod download` | `.go/mod/` | `$CI_PROJECT_DIR/.go/mod/` |
+| **Go** | `go mod download` | `.go/pkg/mod/` | `$CI_PROJECT_DIR/.go/pkg/mod/` |
 | **Rust (Cargo)** | `cargo fetch --locked` | `.cargo/` | `target/` |
 
 ---
@@ -132,7 +143,7 @@ Never use commands that mutate lockfiles in CI (e.g. bare `npm install`, `pip in
 ## 6. Git Transfer Minimization
 
 1. **Shallow Clone (`GIT_DEPTH`)**:
-   By default, GitLab clones the entire Git commit history. Set shallow depth:
+   Newly created projects default to a depth of 20 in their CI/CD settings; older projects, and any project where the setting was cleared, clone the whole history. Pinning the depth in the file makes it hold either way:
    ```yaml
    variables:
      GIT_DEPTH: "20"
