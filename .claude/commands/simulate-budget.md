@@ -1,15 +1,13 @@
 ---
 description: Simulate GitLab CI runner RAM budget, peak memory, and concurrency fit
+argument-hint: "[--stack node|python|go] [--ram MB] [--vcpus N] [--slots N] [--workers N] [--shards N]"
 ---
 
-Run a GitLab CI runner budget simulation to evaluate memory consumption, peak RAM, wall-clock time, and worker fit to prevent Exit 137 OOM kills.
+Estimate GitLab CI runner memory, wall-clock time, and concurrency fit.
 
-### Usage
-When invoked as `/simulate-budget` (with optional arguments like `--stack node --ram 2048 --vcpus 2 --workers 2 --shards 2`):
-
-1. Check for `.gitlab-ci.yml` in the project root to detect the current stack, worker flags, and parallelism settings.
-2. Execute the simulator:
+1. For any flag not given in the arguments, read `.gitlab-ci.yml` for the stack, the worker flag (`--maxWorkers`, `pytest -n`, `go test -p`) and `parallel:`. Use the runner's RAM, vCPUs and slots if known; otherwise keep the script defaults and say so.
+2. Run the simulator (`--help` lists every flag):
    ```bash
-   python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py "$@"
+   python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py $ARGUMENTS
    ```
-3. Report the memory verdict (`FITS`, `TIGHT`, or `OOM_KILL`), CPU saturation, and provide the exact YAML snippet to cap workers and runtime heap limits.
+3. Report the memory status (`FITS`, `TIGHT`, or `OOM_KILL`), each recommendation, and the YAML that applies the printed cap. The figures are estimates from illustrative constants, not measurements of this project.

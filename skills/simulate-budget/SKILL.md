@@ -1,66 +1,36 @@
 ---
 name: simulate-budget
 description: >-
-  Simulate runner memory, peak RAM, wall-clock time, and concurrency fit for a GitLab CI pipeline
-  to prevent Exit 137 OOM kills. Triggered by the `/simulate-budget` slash command.
+  Use when the user runs `/simulate-budget` or asks to estimate, model, or stress-test the memory
+  and runner-concurrency footprint of a GitLab CI test job, for example to check whether a worker
+  count would be OOM killed (exit 137) on a given runner size.
 ---
 
 # /simulate-budget: GitLab CI Runner Simulator
 
-Use this skill when the user triggers the `/simulate-budget` slash command or asks to model, simulate, or stress-test the memory and concurrency footprint of a GitLab CI test suite.
-
----
+The simulator is `scripts/simulate_budget.py` in the sibling `gitlab-ci-optimizer` skill, so install both skills together.
 
 ## Instructions for the Agent
 
-When `/simulate-budget` is triggered:
+### 1. Collect the Parameters
+The script detects nothing itself. For any value the user did not give, read the project:
+- **Stack** (`--stack`, script default `node`): `package.json` means node, `pyproject.toml` / `uv.lock` means python, `go.mod` means go.
+- **Workers** (`--workers`, default 2): `--maxWorkers`, `pytest -n`, `go test -p` in `.gitlab-ci.yml`.
+- **Shards** (`--shards`, default 1): `parallel: N` on the test job.
+- **Runner** (`--ram` 2048, `--vcpus` 2, `--slots` 2): ask, or keep the defaults and say that you assumed them.
 
-### 1. Extract Parameters or Auto-Detect
-Check if the user provided specific flags, e.g.:
-* `--ram <MB>` (default: 2048)
-* `--vcpus <count>` (default: 2)
-* `--slots <count>` (default: 2)
-* `--stack <node|python|go>` (default: auto-detect from project)
-* `--workers <count>` (default: auto-detect from `.gitlab-ci.yml` or default 2)
-* `--shards <count>` (default: auto-detect from `parallel:` or default 1)
-
-If `.gitlab-ci.yml` exists in the repository, inspect it to auto-detect:
-- **Stack**: Node/TypeScript (`package.json`), Python (`pyproject.toml` / `uv.lock`), Go (`go.mod`).
-- **Configured Workers**: Look for `--maxWorkers`, `pytest -n`, `go test -p`.
-- **Configured Shards**: Look for `parallel: N`.
-
-### 2. Execute the Simulator
-Run the Python simulation script:
+### 2. Run the Simulator
 ```bash
-python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py [ARGS]
-```
-
-Example invocations:
-```bash
-# Default 2GB / 2 vCPU runner with Node
 python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py --stack node --ram 2048 --vcpus 2 --slots 2 --workers 2 --shards 2
-
-# Python test suite simulation
-python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py --stack python --ram 2048 --vcpus 2 --slots 2 --workers 2 --shards 2
-
-# Stress test (e.g. 8 workers on 2GB RAM to verify OOM threshold)
-python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py --stack node --ram 2048 --vcpus 2 --slots 2 --workers 8 --shards 1
 ```
+`--help` lists every flag, including `--no-prebuilt` and `--no-install-once`. The exit code is 1 when the job would be OOM killed.
 
-### 3. Present Results & Concrete Remediation
-Present the simulation findings to the user:
-1. **Memory Verdict**:
-   * `FITS`: Headroom is safe for OS and disk I/O buffers.
-   * `TIGHT`: Within 85% of limit. A few large test suites or memory leaks could trigger Exit 137. Recommend worker memory recycling.
-   * `OOM_KILL (Exit 137)`: Peak allocation exceeds container limits. Immediate reduction of workers is mandatory.
-2. **Workers vs. vCPUs**:
-   * If workers exceed vCPUs, warn that extra processes cause CPU thrashing and memory bloat without improving test execution speed.
-3. **Shards vs. Runner Slots**:
-   * If `parallel: N` exceeds concurrent slots, warn that shards will queue in waves.
-4. **Copy-Paste Remediation**:
-   Provide the exact YAML snippet for `.gitlab-ci.yml` to apply the recommended caps (`NODE_OPTIONS`, `GOMEMLIMIT`, `--maxWorkers`, `--workerIdleMemoryLimit`, etc.).
+### 3. Present the Results
+1. **Memory status**: `FITS` (within 75% of runner RAM), `TIGHT` (over 75%), or `OOM_KILL (Exit 137)` (over 100%).
+2. **Each recommendation** the script printed, unchanged.
+3. **The YAML** that applies the printed cap (`NODE_OPTIONS`, `GOMEMLIMIT`, the worker flag).
 
----
+Say that the figures come from illustrative per-worker memory and suite-duration constants, so they compare configurations but do not predict this project's real job. A real peak comes from `memory.peak` in a job log.
 
 ## Related Resources
 * [GitLab CI Optimizer Skill](../gitlab-ci-optimizer/SKILL.md)
