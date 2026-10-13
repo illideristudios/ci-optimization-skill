@@ -1,7 +1,16 @@
 # ==============================================================================
 # Lean GitLab CI Pipeline Template: Node.js / TypeScript
 # Designed for 2 GB / 2 vCPU Docker Runners
-# Lean Score: 100/100
+#
+# Before first use:
+#   1. Commit a Dockerfile.ci (tools only). The first pipeline must be a push to the
+#      default branch that includes it: on any other ref ci:latest does not exist yet
+#      and every job fails on image pull.
+#   2. ci-image uses docker-in-docker, which needs a privileged runner. Give it a
+#      dedicated runner; do not enable privileged mode on a shared one.
+#   3. Protect the `ci` container repository (minimum push access: Maintainer) and
+#      confirm on your GitLab version that the rule covers CI job tokens. Without it
+#      any Developer can overwrite the image that protected pipelines run in.
 # ==============================================================================
 
 # 1. Pipeline Deduplication: Run MR pipeline, skip branch pipeline if open MR exists
@@ -11,6 +20,7 @@ workflow:
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
     - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
 
 # 2. Pipeline Defaults
 default:
@@ -21,7 +31,7 @@ default:
 # 3. Environment Variables & Runtime Memory Caps
 variables:
   GIT_DEPTH: "20"                    # Shallow clone to minimize git checkout overhead
-  # Global heap cap: ~75% of a 2GB runner (1536MB)
+  # Heap cap for single-process jobs (lint, build): 75% of a 2GB runner (1536MB)
   NODE_OPTIONS: "--max-old-space-size=1536"
 
 stages:
@@ -39,6 +49,8 @@ ci-image:
   image: docker:27
   services:
     - docker:27-dind
+  interruptible: false               # A cancelled build is never retried: later pushes do not touch Dockerfile.ci
+  resource_group: ci-image           # One push of ci:latest at a time
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script: []
@@ -92,7 +104,7 @@ test:unit:
     - install
   parallel: 2                        # Shard into 2 side-by-side jobs (match runner slots)
   variables:
-    # Divide heap cap across workers (1536MB / (2 workers + 1) ~ 512MB)
+    # The cap applies to each process: 1536MB / (2 workers + 1 parent) = 512MB
     NODE_OPTIONS: "--max-old-space-size=512"
   script:
     # --maxWorkers=2 pins workers to runner vCPUs; --workerIdleMemoryLimit frees leaked memory
@@ -119,6 +131,8 @@ build:
 # ==============================================================================
 # Heavy E2E Suite: Off the push path (Nightly schedule or manual trigger)
 # ==============================================================================
+# Played more than an hour after its pipeline started, this needs `install` re-run first:
+# the dependency artifact has expired by then.
 test:e2e:
   stage: e2e
   needs:

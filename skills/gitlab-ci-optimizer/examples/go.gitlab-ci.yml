@@ -1,7 +1,16 @@
 # ==============================================================================
 # Lean GitLab CI Pipeline Template: Go
 # Designed for 2 GB / 2 vCPU Docker Runners
-# Lean Score: 100/100
+#
+# Before first use:
+#   1. Commit a Dockerfile.ci (tools only). The first pipeline must be a push to the
+#      default branch that includes it: on any other ref ci:latest does not exist yet
+#      and every job fails on image pull.
+#   2. ci-image uses docker-in-docker, which needs a privileged runner. Give it a
+#      dedicated runner; do not enable privileged mode on a shared one.
+#   3. Protect the `ci` container repository (minimum push access: Maintainer) and
+#      confirm on your GitLab version that the rule covers CI job tokens. Without it
+#      any Developer can overwrite the image that protected pipelines run in.
 # ==============================================================================
 
 workflow:
@@ -10,6 +19,7 @@ workflow:
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
     - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
 
 default:
   image: $CI_REGISTRY_IMAGE/ci:latest
@@ -20,8 +30,10 @@ variables:
   GIT_DEPTH: "20"
   GOPATH: "$CI_PROJECT_DIR/.go"
   GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
-  # Soft memory limit for Go 1.19+ runtime: ~75% of 2GB RAM
-  GOMEMLIMIT: "1500MiB"
+  # Soft limit per process: 75% of 2GB RAM / 2 test binaries (go test -p 2)
+  GOMEMLIMIT: "768MiB"
+  # Before Go 1.25 the runtime sizes itself to the host's cores, not the container's
+  GOMAXPROCS: "2"
 
 stages:
   - .pre
@@ -38,6 +50,8 @@ ci-image:
   image: docker:27
   services:
     - docker:27-dind
+  interruptible: false               # A cancelled build is never retried: later pushes do not touch Dockerfile.ci
+  resource_group: ci-image           # One push of ci:latest at a time
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script: []
@@ -94,6 +108,7 @@ test:unit:
   script:
     # go test -p 2 caps parallel test binaries to 2 vCPUs; AWK partitions packages across shards
     - PKGS=$(go list ./... | awk "NR % $CI_NODE_TOTAL == ($CI_NODE_INDEX - 1)")
+    - '[ -n "$PKGS" ] || { echo "no packages in this shard"; exit 0; }'
     - go test -v -p 2 -race $PKGS
   rules:
     - changes:
@@ -107,20 +122,22 @@ build:
   needs:
     - install
   script:
-    - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/app ./cmd/...
+    - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/ ./cmd/...
   artifacts:
     name: "bin-${CI_COMMIT_REF_SLUG}"
     paths:
       - bin/
     expire_in: 1 day
 
+# Played more than an hour after its pipeline started, this needs `install` re-run first:
+# the dependency artifact has expired by then.
 test:e2e:
   stage: e2e
   needs:
     - install
     - build
   script:
-    - go test -tags=e2e ./test/e2e/...
+    - go test -p 2 -tags=e2e ./test/e2e/...
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - when: manual

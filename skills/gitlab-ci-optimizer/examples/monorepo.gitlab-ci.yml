@@ -1,6 +1,11 @@
 # ==============================================================================
-# Lean GitLab CI Pipeline Template: Monorepo (Dynamic Parent-Child Pipeline)
+# Lean GitLab CI Pipeline Template: Monorepo (Parent-Child Pipeline)
 # Runs isolated child pipelines ONLY for packages with changes
+#
+# This parent only triggers. The memory, install and image rules apply to the child
+# files: audit each of those. A child pipeline's source is parent_pipeline, so each
+# child's workflow: rules must allow `$CI_PIPELINE_SOURCE == "parent_pipeline"`.
+# A push that touches none of the paths below creates no pipeline.
 # ==============================================================================
 
 workflow:
@@ -28,6 +33,7 @@ frontend:
   rules:
     - changes:
         - frontend/**/*
+        - packages/core/**/*           # Dependents retest when the shared package changes
 
 # ------------------------------------------------------------------------------
 # Backend Service Child Pipeline Trigger
@@ -40,6 +46,7 @@ backend:
   rules:
     - changes:
         - backend/**/*
+        - packages/core/**/*
 
 # ------------------------------------------------------------------------------
 # Shared Core Package Child Pipeline Trigger
