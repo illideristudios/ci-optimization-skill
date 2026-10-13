@@ -1,0 +1,35 @@
+---
+description: Enforce Gauntlet GitLab Primer best practices on all GitLab CI configurations
+globs: "**/.gitlab-ci*.yml, **/.gitlab-ci.yml, **/Dockerfile.ci"
+alwaysApply: false
+---
+
+# GitLab CI Pipeline Optimization (Cursor Rules)
+
+Apply these guidelines whenever inspecting or writing `.gitlab-ci.yml` or `Dockerfile.ci`:
+
+## 1. Zero Exit 137 OOM Kills
+Runner containers (1GB–4GB RAM, 2 vCPUs) report host CPUs, causing tools to spawn 16+ workers and exceed memory limits.
+- **Node**: `npx jest --maxWorkers=2 --workerIdleMemoryLimit=512MB`
+  Set `variables: NODE_OPTIONS: "--max-old-space-size=1536"`
+- **Python**: `uv run pytest -n 2`
+  Set `variables: MALLOC_ARENA_MAX: "2"`
+- **Go**: `go test -p 2`
+  Set `variables: GOMEMLIMIT: "1500MiB"`
+
+## 2. Eliminate Setup Taxes
+- **Image Tax**: Build custom tools once in `.pre` via `Dockerfile.ci` and push to `$CI_REGISTRY_IMAGE/ci:latest`.
+- **Install Tax**: One `install` job with frozen lockfiles (`npm ci`, `uv sync --frozen`, `go mod download`). Cache download folders and pass dependencies downstream via artifacts with `expire_in: 1 hour`.
+- **DAG Execution**: Downstream jobs use `needs: [install]` to run immediately with dependencies mounted.
+
+## 3. Hygiene & Concurrency
+- `workflow: rules`: Prevent duplicate pipelines on merge requests.
+- `default: interruptible: true`: Auto-cancel stale pipelines on push.
+- `default: timeout: 15m`: Prevent hung jobs.
+- `parallel: N`: Test sharding must not exceed concurrent runner slots (`N <= slots`).
+- Heavy E2E/scans: Run on schedule (`$CI_PIPELINE_SOURCE == "schedule"`) or manual.
+
+## 4. Diagnostic Scripts
+To verify or model the pipeline:
+- Audit: `python3 .agents/skills/gitlab-ci-optimizer/scripts/audit_pipeline.py .gitlab-ci.yml`
+- Budget Simulation: `python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py`

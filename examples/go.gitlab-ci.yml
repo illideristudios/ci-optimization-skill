@@ -1,0 +1,127 @@
+# ==============================================================================
+# Lean GitLab CI Pipeline Template: Go
+# Designed for 2 GB / 2 vCPU Docker Runners
+# Lean Score: 100/100
+# ==============================================================================
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+default:
+  image: $CI_REGISTRY_IMAGE/ci:latest
+  interruptible: true
+  timeout: 15m
+
+variables:
+  GIT_DEPTH: "20"
+  GOPATH: "$CI_PROJECT_DIR/.go"
+  GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
+  # Soft memory limit for Go 1.19+ runtime: ~75% of 2GB RAM
+  GOMEMLIMIT: "1500MiB"
+
+stages:
+  - .pre
+  - install
+  - test
+  - build
+  - e2e
+
+# ------------------------------------------------------------------------------
+# Layer 1: Prebuilt CI Image (golang:1.23 + golangci-lint baked in)
+# ------------------------------------------------------------------------------
+ci-image:
+  stage: .pre
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script: []
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -f Dockerfile.ci -t "$CI_REGISTRY_IMAGE/ci:latest" .
+    - docker push "$CI_REGISTRY_IMAGE/ci:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - Dockerfile.ci
+
+# ------------------------------------------------------------------------------
+# Layer 2: Download modules once
+# ------------------------------------------------------------------------------
+install:
+  stage: install
+  script:
+    - go mod download
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .go/pkg/mod/
+    policy: pull-push
+  artifacts:
+    name: "gomod-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .go/pkg/mod/
+    expire_in: 1 hour
+
+# ------------------------------------------------------------------------------
+# Layer 3: Test & Lint
+# ------------------------------------------------------------------------------
+lint:
+  stage: test
+  needs:
+    - install
+  script:
+    - golangci-lint run --timeout=5m
+  rules:
+    - changes:
+        - "**/*.go"
+        - go.mod
+        - go.sum
+        - .gitlab-ci.yml
+
+test:unit:
+  stage: test
+  needs:
+    - install
+  parallel: 2                        # Shard across runner slots
+  script:
+    # go test -p 2 caps parallel test binaries to 2 vCPUs; AWK partitions packages across shards
+    - PKGS=$(go list ./... | awk "NR % $CI_NODE_TOTAL == ($CI_NODE_INDEX - 1)")
+    - go test -v -p 2 -race $PKGS
+  rules:
+    - changes:
+        - "**/*.go"
+        - go.mod
+        - go.sum
+        - .gitlab-ci.yml
+
+build:
+  stage: build
+  needs:
+    - install
+  script:
+    - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/app ./cmd/...
+  artifacts:
+    name: "bin-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - bin/
+    expire_in: 1 day
+
+test:e2e:
+  stage: e2e
+  needs:
+    - install
+    - build
+  script:
+    - go test -tags=e2e ./test/e2e/...
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: manual
+      allow_failure: true
