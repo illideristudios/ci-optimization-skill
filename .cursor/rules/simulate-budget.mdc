@@ -1,0 +1,26 @@
+---
+description: Simulate runner memory, peak RAM, wall-clock time, and worker concurrency fit
+globs: ""
+alwaysApply: false
+---
+
+# /simulate-budget (Cursor Command Rule)
+
+When the user asks to simulate runner memory, check for OOM risks, or triggers `/simulate-budget`:
+
+1. Run the simulation script:
+   ```bash
+   python3 .agents/skills/gitlab-ci-optimizer/scripts/simulate_budget.py [flags]
+   ```
+   Supported flags:
+   - `--stack <node|python|go>`
+   - `--ram <MB>` (e.g. 1024, 2048, 4096)
+   - `--vcpus <count>` (e.g. 2)
+   - `--slots <count>` (concurrent runner slots)
+   - `--workers <count>` (test processes per job)
+   - `--shards <count>` (parallel test jobs)
+
+2. Evaluate the output:
+   - If `OOM_KILL (Exit 137)`: Warn the user and report the worker count the script recommends.
+   - If workers > vCPUs: Recommend capping workers to vCPUs to prevent CPU thrashing.
+   - If shards > slots: Recommend reducing shards to prevent queueing in waves.

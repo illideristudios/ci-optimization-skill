@@ -1,6 +1,7 @@
 # ==============================================================================
 # Lean GitLab CI Pipeline Template: Go
 # Designed for 2 GB / 2 vCPU Docker Runners
+# Lean Score: 100/100
 #
 # Before first use:
 #   1. Commit a Dockerfile.ci (tools only). The first pipeline must be a push to the

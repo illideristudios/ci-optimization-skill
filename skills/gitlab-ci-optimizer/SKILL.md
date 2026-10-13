@@ -18,7 +18,7 @@ Rules and tools for building lean, fast GitLab CI/CD pipelines that survive smal
 
 Both scripts live in this skill's `scripts/` directory and need only Python 3. The commands below assume the skill is installed at `.agents/skills/gitlab-ci-optimizer/`; adjust the prefix if it lives elsewhere.
 
-1. **Audit an existing pipeline against the 11-point lean checklist**:
+1. **Audit an existing pipeline against the 11-point lean scorecard**:
    ```bash
    python3 .agents/skills/gitlab-ci-optimizer/scripts/audit_pipeline.py .gitlab-ci.yml
    ```
@@ -104,8 +104,9 @@ Replace per-job `npm install` / `pip install` / `go mod download` with a dedicat
 
 ### Step 7: Validate
 1. Run `python3 .agents/skills/gitlab-ci-optimizer/scripts/audit_pipeline.py .gitlab-ci.yml`.
-2. Treat each `FAIL` as a pointer to read that part of the YAML. The auditor matches text in one file and does not follow `include:`, `extends:` or anchors, so confirm a finding before changing the pipeline, and never add a job or keyword only to turn a check green.
-3. Validate the syntax with GitLab's CI Lint: `glab ci lint`, or the pipeline editor.
+2. Ensure the Lean Score reaches >= 90/100.
+3. Treat each `FAIL` as a pointer to read that part of the YAML. The auditor matches text in one file and does not follow `include:`, `extends:` or anchors, so confirm a finding before changing the pipeline, and never add a job or keyword only to turn a check green.
+4. Validate the syntax with GitLab's CI Lint: `glab ci lint`, or the pipeline editor.
 
 ---
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 GitLab CI Pipeline Lean Auditor
-Checks a .gitlab-ci.yml against the lean checklist in SKILL.md.
+Evaluates a .gitlab-ci.yml against the 11-point lean scorecard from the
+Gauntlet GitLab Primer and industry best practices.
 
 Exit 0 when every applicable check passes, 1 when one fails, 2 when the
 file cannot be read or holds no jobs.
@@ -27,7 +28,6 @@ NODE_STACK = r"\b(?:npm|npx|pnpm|yarn|node|jest|vitest)\b"
 INSTALL = r"\b(?:npm ci|npm install|npm i|pnpm install|yarn install|uv sync|pip install|poetry install|go mod download|bundle install)\b"
 TOOL_INSTALL = r"\b(?:apt-get|apt|apk|yum|dnf)\b[^|;&]*\b(?:install|add)\b|\bnpm (?:install|i) (?:-g|--global)\b|\bcurl\b.*\|\s*(?:ba)?sh\b"
 HEAVY = r"playwright|cypress|selenium|e2e|\bdast\b|\bsast\b"
-OFF_PUSH_PATH = r"CI_PIPELINE_SOURCE\s*==\s*['\"]schedule['\"]|when:\s*manual"
 
 
 def minutes(value):
@@ -51,6 +51,48 @@ def top_level_blocks(text):
         if key:
             blocks[key.group(1)] = chunk
     return blocks
+
+
+def nested(body, key):
+    """The lines indented under `key:` in a block."""
+    match = re.search(rf"^([ \t]+){key}:[ \t]*\n((?:\1[ \t]+.*\n|\s*\n)*)", body + "\n", re.M)
+    return match.group(2) if match else ""
+
+
+def off_push_path(body):
+    """True when no rule lets a push start the job: every rule is a schedule, manual or never."""
+    rules = nested(body, "rules")
+    if not rules.strip():
+        return bool(re.search(r"^\s+when:\s*manual", body, re.M))
+    indent = re.match(r"\s*", rules).group()
+    items = re.split(rf"^{indent}- ", rules, flags=re.M)[1:]
+    return all(re.search(r"CI_PIPELINE_SOURCE\s*==\s*['\"]schedule['\"]|when:\s*(?:manual|never)", item) for item in items)
+
+
+def heap_over_budget(name, body, variables, max_workers, heap_limit):
+    """Why this job's heap ceilings, summed over its processes, miss the budget, or None."""
+    def cap(pattern, unit=lambda n, u: float(n)):
+        found = re.findall(pattern, body) or re.findall(pattern, variables)
+        return unit(*found[-1]) if found else None
+
+    def count(pattern):
+        # A count over max_workers is the worker check's finding; budget the heap for the cap it asks for.
+        workers = re.search(pattern, body)
+        return min(int(workers.group(1)), max_workers) if workers and workers.group(1).isdigit() else max_workers
+
+    checks = []
+    if re.search(NODE_STACK, body):
+        processes = count(r"(?:--maxWorkers|max(?:Forks|Threads)|-w)[= ](\S+)") + 1 if re.search(r"\b(?:jest|vitest)\b", body) else 1
+        checks.append(("--max-old-space-size", cap(r"--max-old-space-size=(\d+)()"), processes))
+    if re.search(r"\bgo (?:test|build)\b", body):
+        processes = count(r"(?<!\S)-p[= ](\S+)") if re.search(r"\bgo test\b", body) else 1
+        checks.append(("GOMEMLIMIT", cap(r"GOMEMLIMIT[:=]\s*['\"]?(\d+(?:\.\d+)?)([KMG]?)i?B?\b", lambda n, u: float(n) * MIB[u.lower()]), processes))
+    for flag, mb, processes in checks:
+        if mb is None:
+            return f"{name}: no {flag}"
+        if mb * processes > heap_limit:
+            return f"{name}: {flag} {mb:.0f} MB x {processes} processes"
+    return None
 
 
 def uncapped_runner(line, max_workers):
@@ -91,7 +133,9 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
         checks[key] = {"ok": ok, "title": title, "detail": "Not applicable to this pipeline." if ok is None else passed if ok else fix}
 
     dedup = "CI_OPEN_MERGE_REQUESTS" in workflow and re.search(r"when:\s*never", workflow)
-    one_source = "rules:" in workflow and not ("merge_request_event" in workflow and "CI_COMMIT_BRANCH" in workflow)
+    # Only merge request pipelines or only branch pipelines, with no catch-all rule that admits the other.
+    catch_all = re.search(r"^\s*- when:\s*(?:always|on_success|manual|delayed)", workflow, re.M)
+    one_source = ("merge_request_event" in workflow) != ("CI_COMMIT_BRANCH" in workflow) and not catch_all
     check("one_pipeline_per_push", "One pipeline per push (workflow: rules)", bool(dedup or one_source),
           "workflow: rules cannot start both a branch and a merge request pipeline for one push.",
           "Add workflow: rules with `- if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS` / `when: never`.")
@@ -129,16 +173,13 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
           f"All {len(runner_lines)} test commands cap their workers.",
           f"Uncapped test commands: {'; '.join(sorted(set(uncapped)))}.")
 
-    heaps = [int(mb) for mb in re.findall(r"--max-old-space-size=(\d+)", text)]
-    go_limits = [float(n) * MIB[unit.lower()] for n, unit in re.findall(r"GOMEMLIMIT[:=]\s*['\"]?(\d+(?:\.\d+)?)([KMG]?)i?B?\b", text)]
-    heap_ok = None
-    if re.search(NODE_STACK, text):
-        heap_ok = bool(heaps) and max(heaps) <= heap_limit
-    if re.search(r"\bgo (?:test|build)\b", text):
-        heap_ok = heap_ok is not False and bool(go_limits) and max(go_limits) <= heap_limit
-    check("heap_capping", f"Runtime heap ceiling <= {HEAP_FRACTION:.0%} of runner RAM ({ram_mb} MB)", heap_ok,
-          f"Heap ceilings are set and within {heap_limit:.0f} MB.",
-          f'Set NODE_OPTIONS: "--max-old-space-size=N" (Node) or GOMEMLIMIT (Go) to at most {heap_limit:.0f} MB, divided by the number of processes.')
+    variables = blocks.get("variables", "")
+    heap_jobs = [name for name, body in jobs.items() if re.search(NODE_STACK + r"|\bgo (?:test|build)\b", body)]
+    over = [why for why in (heap_over_budget(name, jobs[name], variables, max_workers, heap_limit) for name in heap_jobs) if why]
+    check("heap_capping", f"Runtime heap ceiling <= {HEAP_FRACTION:.0%} of runner RAM ({ram_mb} MB)",
+          None if not heap_jobs else not over,
+          f"Every job's heap ceilings, summed over its processes, fit in {heap_limit:.0f} MB.",
+          f"Over the {heap_limit:.0f} MB budget or uncapped: {'; '.join(over)}. Divide the ceiling by the processes the job runs.")
 
     installs = [line.strip() for line in text.splitlines() if re.search(INSTALL, line)]
     check("install_once", "Dependencies installed in one job only",
@@ -152,36 +193,50 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
           "No apt/apk/yum/npm -g/curl|sh installs in any script.",
           f"Move these into Dockerfile.ci: {'; '.join(tool_installs)}")
 
-    gated = [name for name, body in jobs.items() if re.search(TEST_RUNNER + r"|^\s+trigger:", body, re.M)]
+    gated = [name for name, body in jobs.items() if re.search(TEST_RUNNER + r"|^\s+trigger:", body, re.M) and not off_push_path(body)]
+    ungated = [name for name in gated if not re.search(r"^\s+(?:- )?changes:", jobs[name], re.M)]
     check("skip_unchanged", "Test or trigger jobs skip untouched code (rules: changes:)",
-          None if not gated else any(re.search(r"^\s+(?:- )?changes:", jobs[name], re.M) for name in gated),
-          "At least one test or trigger job is gated by rules: changes:.",
-          "No test or trigger job uses `rules: changes:`, so every job runs on every push.")
+          None if not gated else not ungated,
+          "Every test or trigger job on the push path is gated by rules: changes:.",
+          f"These run on every push whatever changed: {', '.join(ungated)}. Add `rules: changes:` to each.")
 
     heavy = [name for name, body in jobs.items() if re.search(HEAVY, body, re.I)]
-    on_push = [name for name in heavy if not re.search(OFF_PUSH_PATH, jobs[name])]
+    on_push = [name for name in heavy if not off_push_path(jobs[name])]
     check("heavy_off_push_path", "E2E and security scans off the push path (schedule or manual)",
           None if not heavy else not on_push,
           f"Heavy jobs run on a schedule or manually: {', '.join(heavy)}.",
           f"These run on every push: {', '.join(on_push)}. Gate them with a schedule rule or `when: manual`.")
 
+    passed = sum(1 for c in checks.values() if c["ok"])
+    failed = sum(1 for c in checks.values() if c["ok"] is False)
     return {
         "jobs": len(jobs),
-        "passed": sum(1 for c in checks.values() if c["ok"]),
-        "failed": sum(1 for c in checks.values() if c["ok"] is False),
+        "score": round(passed / (passed + failed) * 100) if passed + failed else 0,
+        "passed": passed,
+        "failed": failed,
         "checks": checks,
     }
 
 
 def print_report(res, filename):
-    print(f"GITLAB CI PIPELINE AUDIT: {filename}")
-    print(f"{res['passed']} of {res['passed'] + res['failed']} applicable checks passed")
+    print("=" * 68)
+    print(f"  GITLAB CI PIPELINE AUDIT REPORT: {filename}")
+    print(f"  LEAN SCORE: {res['score']} / 100  ({res['passed']}/{res['passed'] + res['failed']} applicable checks passed)")
+    print("=" * 68)
     print()
     for c in res["checks"].values():
         print(f"[{ {True: 'PASS', False: 'FAIL', None: ' N/A'}[c['ok']] }] {c['title']}")
         print(f"       {c['detail']}")
     print()
+    print("-" * 68)
+    if res["score"] >= 85:
+        print("Verdict: EXCELLENT. Pipeline follows lean best practices.")
+    elif res["score"] >= 60:
+        print("Verdict: MODERATE. Apply recommended remediation to prevent OOMs & save runner minutes.")
+    else:
+        print("Verdict: HIGH RISK. Pipeline is prone to OOM kills (137) and excessive runner billing.")
     print("These are text matches on one file: read the YAML before acting on a result.")
+    print("-" * 68)
 
 
 def main(argv=None):

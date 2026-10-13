@@ -59,8 +59,8 @@ Then copy the adapter for each agent you use:
 | :--- | :--- | :--- |
 | **Google Antigravity** | nothing more | Loads both skills from `.agents/skills/`. |
 | **Claude Code** | `.claude/commands/simulate-budget.md` | Adds the `/simulate-budget` command. |
-| **Cursor** | `.cursor/rules/gitlab-ci.mdc`, `.cursor/commands/simulate-budget.md` | Attaches the skill when a `.gitlab-ci*.yml` or `Dockerfile.ci` is open; adds `/simulate-budget`. |
-| **Codex and other `AGENTS.md` readers** | `AGENTS.md` (or its section) | Points the agent at the skill. |
+| **Cursor** | `.cursorrules`, `.cursor/rules/*.mdc` | Attaches the optimization rules when a `.gitlab-ci*.yml` or `Dockerfile.ci` is open; `/simulate-budget` rule. |
+| **OpenAI Codex / Copilot** | `CODEX.md`, `AGENTS.md`, `.codex/instructions.md` | Multi-agent instructions and CLI memory budgeting guides. |
 
 In this repository `.agents/skills` is a symlink to `skills/`, so the same paths work here.
 
@@ -83,8 +83,8 @@ python3 skills/gitlab-ci-optimizer/scripts/simulate_budget.py \
 
 `--no-prebuilt` and `--no-install-once` model a pipeline without those two fixes. The exit code is 1 when the job would be OOM killed. The simulator does not read your pipeline: suite duration and per-worker memory are illustrative constants, so it compares configurations and does not predict a real job.
 
-### 2. 11-Point Lean Checklist Pipeline Auditor
-Checks a `.gitlab-ci.yml` against the checklist below:
+### 2. 11-Point Lean Scorecard Pipeline Auditor
+Audits any `.gitlab-ci.yml` against the scorecard below and prints a Lean Score from 0 to 100, the share of applicable checks that pass:
 
 ```bash
 python3 skills/gitlab-ci-optimizer/scripts/audit_pipeline.py path/to/.gitlab-ci.yml
@@ -99,10 +99,10 @@ The checks:
 4. Every `artifacts:` block expires within 1 day
 5. Shallow git clone (`GIT_DEPTH` 1-20)
 6. Test workers capped to runner vCPUs (`--maxWorkers`, `-n`, `-p`, `--workers`)
-7. Runtime heap ceiling <= 75% of runner RAM (`NODE_OPTIONS`, `GOMEMLIMIT`)
+7. Runtime heap ceiling, summed over a job's processes, <= 75% of runner RAM (`NODE_OPTIONS`, `GOMEMLIMIT`)
 8. Dependencies installed in one job only
 9. No tool installs at job time (prebuilt CI image)
-10. Test or trigger jobs skip untouched code (`rules: changes:`)
+10. Every test or trigger job on the push path skips untouched code (`rules: changes:`)
 11. E2E and security scans off the push path (`schedule` or `manual`)
 
 The auditor matches text in one block-style YAML file with comments removed. It does not follow `include:`, `extends:` or anchors, so read the YAML before acting on a result.
@@ -119,16 +119,22 @@ python3 -m unittest discover -s tests
 
 ```text
 .
+├── SKILL.md                          # Master skill entrypoint
 ├── README.md                         # Project documentation
-├── AGENTS.md                         # Pointer to the skill for AGENTS.md readers (Codex, Cursor, ...)
+├── AGENTS.md                         # Universal multi-agent specification
+├── CODEX.md                          # OpenAI Codex configuration & field manual
+├── .cursorrules                      # Project-level Cursor AI instructions
 ├── .agents/skills -> ../skills       # The path every agent file uses
 ├── .claude/commands/
 │   └── simulate-budget.md            # Claude Code /simulate-budget slash command
-├── .cursor/
-│   ├── rules/gitlab-ci.mdc           # Attaches the skill on .gitlab-ci*.yml and Dockerfile.ci
-│   └── commands/simulate-budget.md   # Cursor /simulate-budget command
+├── .cursor/rules/
+│   ├── gitlab-ci.mdc                 # Auto-trigger rule for .gitlab-ci*.yml files
+│   └── simulate-budget.mdc           # Cursor slash command / simulation rule
+├── .codex/
+│   └── instructions.md               # Codex workspace prompt
+├── scripts/ references/ examples/    # Root copy of the skill's directories (a test keeps them identical)
 ├── skills/
-│   ├── gitlab-ci-optimizer/
+│   ├── gitlab-ci-optimizer/          # Packaged skill bundle
 │   │   ├── SKILL.md                  # Skill entrypoint: the rules and the workflow
 │   │   ├── scripts/
 │   │   │   ├── audit_pipeline.py     # 11-point lean checklist auditor CLI
@@ -138,9 +144,9 @@ python3 -m unittest discover -s tests
 │   │   │   ├── setup-tax-and-caching.md      # The 3 taxes, Dockerfile.ci & install-once DAG
 │   │   │   └── dag-and-sharding.md           # needs:, parallel: N sharding, workflow:rules
 │   │   └── examples/
-│   │       ├── node.gitlab-ci.yml        # Node.js / TypeScript template
-│   │       ├── python.gitlab-ci.yml      # Python (uv + Pytest) template
-│   │       ├── go.gitlab-ci.yml          # Go (go mod + go test) template
+│   │       ├── node.gitlab-ci.yml        # 100/100 lean template for Node.js / TypeScript
+│   │       ├── python.gitlab-ci.yml      # 100/100 lean template for Python (uv + Pytest)
+│   │       ├── go.gitlab-ci.yml          # 100/100 lean template for Go (go mod + go test)
 │   │       └── monorepo.gitlab-ci.yml    # Parent pipeline that triggers per-package children
 │   └── simulate-budget/              # /simulate-budget skill (uses the simulator above)
 └── tests/

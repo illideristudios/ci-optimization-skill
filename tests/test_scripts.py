@@ -25,7 +25,7 @@ MUTATIONS = {
     "heap_capping": ("--max-old-space-size=1536", "--max-old-space-size=8192"),
     "install_once": ("- npm run lint", "- npm ci && npm run lint"),
     "prebuilt_ci_image": ("- npm run build", "- apt-get install -y jq && npm run build"),
-    "heavy_off_push_path": ('    - if: $CI_PIPELINE_SOURCE == "schedule"\n    - when: manual\n      allow_failure: true', "    - if: $CI_COMMIT_BRANCH"),
+    "heavy_off_push_path": ('    - if: $CI_PIPELINE_SOURCE == "schedule"\n    - when: manual\n      allow_failure: true', "    - if: $CI_COMMIT_BRANCH\n      changes:\n        - src/**/*"),
 }
 
 # Every keyword sits in a comment; the one real job breaks most of the rules.
@@ -63,11 +63,42 @@ class AuditTest(unittest.TestCase):
             with self.subTest(path.name):
                 self.assertEqual(failed(path.read_text()), set())
 
+    def test_score_is_the_share_of_applicable_checks_that_pass(self):
+        self.assertEqual(audit.audit_pipeline(NODE)["score"], 100)
+        self.assertEqual(audit.audit_pipeline(NODE.replace("timeout: 15m", "timeout: 2h"))["score"], 91)
+        self.assertEqual(audit.audit_pipeline(JUNK)["score"], 10)
+
+    def test_root_copy_matches_the_packaged_skill(self):
+        root = SKILL.parent.parent
+        for path in sorted(p for p in SKILL.rglob("*") if p.is_file()):
+            with self.subTest(str(path.relative_to(SKILL))):
+                self.assertEqual((root / path.relative_to(SKILL)).read_bytes(), path.read_bytes())
+
     def test_each_rule_fails_when_the_node_example_breaks_it(self):
         for key, (old, new) in MUTATIONS.items():
             with self.subTest(key):
                 self.assertIn(old, NODE)
                 self.assertEqual(failed(NODE.replace(old, new)), {key})
+
+    def test_heap_cap_counts_every_process_of_a_job(self):
+        override = '    NODE_OPTIONS: "--max-old-space-size=512"\n'
+        self.assertIn(override, NODE)
+        self.assertEqual(failed(NODE.replace(override, "")), {"heap_capping"})  # 1536 MB x (2 workers + parent)
+
+    def test_catch_all_workflow_rule_allows_duplicate_pipelines(self):
+        start, end = NODE.index("workflow:"), NODE.index("# 2. Pipeline Defaults")
+        self.assertEqual(failed(NODE[:start] + "workflow:\n  rules:\n    - when: always\n\n" + NODE[end:]), {"one_pipeline_per_push"})
+
+    def test_every_push_path_test_job_needs_changes(self):
+        gate = "    - changes:\n        - src/**/*\n        - test/**/*\n"
+        self.assertIn(gate, NODE)
+        self.assertEqual(failed(NODE.replace(gate, "    - exists:\n        - src/**/*\n        - test/**/*\n")), {"skip_unchanged"})
+
+    def test_heavy_job_with_a_schedule_rule_and_a_branch_rule_is_on_the_push_path(self):
+        rules = '    - if: $CI_PIPELINE_SOURCE == "schedule"\n    - when: manual\n      allow_failure: true'
+        self.assertIn(rules, NODE)
+        mutated = NODE.replace(rules, '    - if: $CI_PIPELINE_SOURCE == "schedule"\n    - if: $CI_COMMIT_BRANCH')
+        self.assertEqual(failed(mutated), {"heavy_off_push_path", "skip_unchanged"})
 
     def test_changes_on_the_image_job_alone_does_not_count(self):
         head, sep, tail = NODE.partition("\ninstall:\n")
@@ -86,7 +117,9 @@ class AuditTest(unittest.TestCase):
 
     def test_thresholds_follow_the_runner_size(self):
         self.assertEqual(failed(NODE, ram_mb=1024), {"heap_capping"})
-        self.assertEqual(failed(NODE.replace("--maxWorkers=2", "--maxWorkers=4"), max_workers=4), set())
+        four_workers = NODE.replace("--maxWorkers=2", "--maxWorkers=4")
+        self.assertEqual(failed(four_workers, max_workers=4), {"heap_capping"})  # 512 MB x 5 processes > 1536 MB
+        self.assertEqual(failed(four_workers, max_workers=4, ram_mb=4096), set())
 
     def test_durations(self):
         for text, minutes in [("15m", 15), ("1h 30m", 90), ("2 hours", 120), ("30 days", 43200), ("3600", 60), ("never", None)]:
