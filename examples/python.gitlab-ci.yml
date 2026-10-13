@@ -1,0 +1,148 @@
+# ==============================================================================
+# Lean GitLab CI Pipeline Template: Python (uv & Pytest)
+# Designed for 2 GB / 2 vCPU Docker Runners
+# Lean Score: 100/100
+#
+# Before first use:
+#   1. Commit a Dockerfile.ci (tools only). The first pipeline must be a push to the
+#      default branch that includes it: on any other ref ci:latest does not exist yet
+#      and every job fails on image pull.
+#   2. ci-image uses docker-in-docker, which needs a privileged runner. Give it a
+#      dedicated runner; do not enable privileged mode on a shared one.
+#   3. Protect the `ci` container repository (minimum push access: Maintainer) and
+#      confirm on your GitLab version that the rule covers CI job tokens. Without it
+#      any Developer can overwrite the image that protected pipelines run in.
+# ==============================================================================
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+default:
+  image: $CI_REGISTRY_IMAGE/ci:latest
+  interruptible: true
+  timeout: 15m
+
+variables:
+  GIT_DEPTH: "20"
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+  UV_LINK_MODE: "copy"
+  PYTHONUNBUFFERED: "1"
+  MALLOC_ARENA_MAX: "2"              # Curtails glibc memory fragmentation in multi-process pytest
+
+stages:
+  - .pre
+  - install
+  - test
+  - build
+  - e2e
+
+# ------------------------------------------------------------------------------
+# Prebuilt CI Image (Python 3.12-slim + uv baked in)
+# ------------------------------------------------------------------------------
+ci-image:
+  stage: .pre
+  image: docker:27
+  services:
+    - docker:27-dind
+  interruptible: false               # A cancelled build is never retried: later pushes do not touch Dockerfile.ci
+  resource_group: ci-image           # One push of ci:latest at a time
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script: []
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -f Dockerfile.ci -t "$CI_REGISTRY_IMAGE/ci:latest" .
+    - docker push "$CI_REGISTRY_IMAGE/ci:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - Dockerfile.ci
+
+# ------------------------------------------------------------------------------
+# Install once: Sync virtual environment into .venv/
+# ------------------------------------------------------------------------------
+install:
+  stage: install
+  script:
+    - uv sync --frozen
+  cache:
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .uv-cache/
+    policy: pull-push
+  artifacts:
+    name: "venv-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .venv/
+    expire_in: 1 hour
+
+# ------------------------------------------------------------------------------
+# Fast parallel jobs using mounted .venv
+# ------------------------------------------------------------------------------
+lint:
+  stage: test
+  needs:
+    - install
+  script:
+    - uv run ruff check .
+    - uv run ruff format --check .
+  rules:
+    - changes:
+        - src/**/*
+        - tests/**/*
+        - pyproject.toml
+        - uv.lock
+        - .gitlab-ci.yml
+
+test:unit:
+  stage: test
+  needs:
+    - install
+  parallel: 2                        # 2 shards side by side
+  script:
+    # -n needs pytest-xdist and --splits/--group need pytest-split: both must be in uv.lock.
+    # Cap workers to 2 (-n 2) to match 2 vCPUs. Commit a .test_durations file to split by time, not count.
+    - uv run pytest -n 2 --splits $CI_NODE_TOTAL --group $CI_NODE_INDEX
+  rules:
+    - changes:
+        - src/**/*
+        - tests/**/*
+        - pyproject.toml
+        - uv.lock
+        - .gitlab-ci.yml
+
+build:
+  stage: build
+  needs:
+    - install
+  script:
+    - uv build
+  artifacts:
+    name: "dist-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - dist/
+    expire_in: 1 day
+
+# ------------------------------------------------------------------------------
+# Heavy Integration / E2E
+# ------------------------------------------------------------------------------
+# Played more than an hour after its pipeline started, this needs `install` re-run first:
+# the dependency artifact has expired by then.
+test:e2e:
+  stage: e2e
+  needs:
+    - install
+    - build
+  script:
+    - uv run pytest tests/e2e
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: manual
+      allow_failure: true

@@ -1,0 +1,61 @@
+# ==============================================================================
+# Lean GitLab CI Pipeline Template: Monorepo (Parent-Child Pipeline)
+# Runs isolated child pipelines ONLY for packages with changes
+#
+# This parent only triggers. The memory, install and image rules apply to the child
+# files: audit each of those. A child pipeline's source is parent_pipeline, so each
+# child's workflow: rules must allow `$CI_PIPELINE_SOURCE == "parent_pipeline"`.
+# A push that touches none of the paths below creates no pipeline.
+# ==============================================================================
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+default:
+  interruptible: true
+  timeout: 15m
+
+stages:
+  - triggers
+
+# ------------------------------------------------------------------------------
+# Frontend Child Pipeline Trigger
+# ------------------------------------------------------------------------------
+frontend:
+  stage: triggers
+  trigger:
+    include: frontend/.gitlab-ci.yml
+    strategy: depend                 # Mirrors status of child pipeline to parent
+  rules:
+    - changes:
+        - frontend/**/*
+        - packages/core/**/*           # Dependents retest when the shared package changes
+
+# ------------------------------------------------------------------------------
+# Backend Service Child Pipeline Trigger
+# ------------------------------------------------------------------------------
+backend:
+  stage: triggers
+  trigger:
+    include: backend/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - changes:
+        - backend/**/*
+        - packages/core/**/*
+
+# ------------------------------------------------------------------------------
+# Shared Core Package Child Pipeline Trigger
+# ------------------------------------------------------------------------------
+packages-core:
+  stage: triggers
+  trigger:
+    include: packages/core/.gitlab-ci.yml
+    strategy: depend
+  rules:
+    - changes:
+        - packages/core/**/*
