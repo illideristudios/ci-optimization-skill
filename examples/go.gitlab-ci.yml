@@ -26,6 +26,13 @@ default:
   image: $CI_REGISTRY_IMAGE/ci:latest
   interruptible: true
   timeout: 15m
+  cache:                             # Every job reads the dependencies install wrote; none writes
+    key:
+      files:
+        - go.sum
+    paths:
+      - .go/pkg/mod/
+    policy: pull
 
 variables:
   GIT_DEPTH: "20"
@@ -56,6 +63,7 @@ ci-image:
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script: []
+  cache: []                          # Builds the image: needs no dependencies
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker build -f Dockerfile.ci -t "$CI_REGISTRY_IMAGE/ci:latest" .
@@ -78,12 +86,7 @@ install:
         - go.sum
     paths:
       - .go/pkg/mod/
-    policy: pull-push
-  artifacts:
-    name: "gomod-${CI_COMMIT_REF_SLUG}"
-    paths:
-      - .go/pkg/mod/
-    expire_in: 1 hour
+    policy: pull-push                # Only install writes the cache; it uploads no artifacts
 
 # ------------------------------------------------------------------------------
 # Layer 3: Test & Lint
@@ -128,10 +131,10 @@ build:
     name: "bin-${CI_COMMIT_REF_SLUG}"
     paths:
       - bin/
-    expire_in: 1 day
+    expire_in: 1 hour                # test:e2e needs this exact output; nothing else keeps it
 
-# Played more than an hour after its pipeline started, this needs `install` re-run first:
-# the dependency artifact has expired by then.
+# Played more than an hour after its pipeline started, this needs `build` re-run first:
+# its artifact has expired by then.
 test:e2e:
   stage: e2e
   needs:

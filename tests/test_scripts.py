@@ -108,6 +108,26 @@ class AuditTest(unittest.TestCase):
         unshared = "deps:\n  script:\n    - npm ci\ntest:\n  script:\n    - npx jest --maxWorkers=2\n"
         self.assertIn("install_once", failed(unshared))
 
+    def test_install_job_that_uploads_artifacts_is_not_install_once(self):
+        # Dependencies passed as artifacts filled a project's GitLab storage to 1.68 GB (2026-10-19).
+        policy = "    policy: pull-push                # Only install writes the cache; it uploads no artifacts\n"
+        self.assertIn(policy, NODE)
+        uploads = NODE.replace(policy, policy + "  artifacts:\n    paths:\n      - node_modules/\n    expire_in: 1 hour\n")
+        self.assertEqual(failed(uploads), {"install_once"})
+
+    def test_install_once_is_a_lockfile_keyed_cache_that_install_fills_and_consumers_pull(self):
+        head, sep, tail = NODE.partition("\ninstall:\n")
+        lockfile_key = "    key:\n      files:\n        - package-lock.json\n"
+        self.assertIn(lockfile_key, tail)
+        self.assertEqual(failed(head + sep + tail.replace(lockfile_key, "    key: $CI_COMMIT_REF_SLUG\n", 1)), {"install_once"})
+        self.assertEqual(failed(head + sep + tail.replace("policy: pull-push", "policy: pull", 1)), {"install_once"})
+        self.assertIn("    policy: pull\n", head)
+        self.assertEqual(failed(head.replace("    policy: pull\n", "") + sep + tail), {"install_once"})  # consumers would push
+
+    def test_artifacts_expire_within_an_hour(self):
+        self.assertEqual(failed(NODE.replace("expire_in: 1 hour", "expire_in: 1 day")), {"artifact_expiration"})
+        self.assertEqual(failed(NODE.replace("    expire_in: 1 hour", "    when: on_success")), {"artifact_expiration"})
+
     def test_catch_all_workflow_rule_allows_duplicate_pipelines(self):
         start, end = NODE.index("workflow:"), NODE.index("# 2. Pipeline Defaults")
         self.assertEqual(failed(NODE[:start] + "workflow:\n  rules:\n    - when: always\n\n" + NODE[end:]), {"one_pipeline_per_push"})

@@ -28,6 +28,14 @@ default:
   image: $CI_REGISTRY_IMAGE/ci:latest
   interruptible: true                # Automatically cancel stale runs on new commit
   timeout: 15m                       # Terminate hung jobs quickly
+  cache:                             # Every job reads the dependencies install wrote; none writes
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+      - node_modules/
+    policy: pull
 
 # 3. Environment Variables & Runtime Memory Caps
 variables:
@@ -55,6 +63,7 @@ ci-image:
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script: []
+  cache: []                          # Builds the image: needs no dependencies
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker build -f Dockerfile.ci -t "$CI_REGISTRY_IMAGE/ci:latest" .
@@ -77,12 +86,8 @@ install:
         - package-lock.json
     paths:
       - .npm/
-    policy: pull-push                # Only install job updates the cache
-  artifacts:
-    name: "deps-${CI_COMMIT_REF_SLUG}"
-    paths:
       - node_modules/
-    expire_in: 1 hour                # Ephemeral: don't bloat server storage
+    policy: pull-push                # Only install writes the cache; it uploads no artifacts
 
 # ==============================================================================
 # Layer 3: The Job Work (Only pay for actual work on each push)
@@ -127,13 +132,13 @@ build:
     name: "dist-${CI_COMMIT_REF_SLUG}"
     paths:
       - dist/
-    expire_in: 1 day                 # Fast expiration for non-release builds
+    expire_in: 1 hour                # test:e2e ships this exact bundle; nothing else keeps it
 
 # ==============================================================================
 # Heavy E2E Suite: Off the push path (Nightly schedule or manual trigger)
 # ==============================================================================
-# Played more than an hour after its pipeline started, this needs `install` re-run first:
-# the dependency artifact has expired by then.
+# Played more than an hour after its pipeline started, this needs `build` re-run first:
+# its artifact has expired by then.
 test:e2e:
   stage: e2e
   needs:
