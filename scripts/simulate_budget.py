@@ -105,7 +105,7 @@ def simulate(stack_name, ram_mb, vcpus, runner_slots, workers, shards, prebuilt=
     if not prebuilt:
         recommendations.append("Bake tools into Dockerfile.ci pushed to $CI_REGISTRY_IMAGE/ci:latest to save setup time in every job.")
     if not install_once:
-        recommendations.append("Use a single install job that passes dependencies via artifacts (expire_in: 1 hour) with needs: [install].")
+        recommendations.append("Use a single install job that fills a lockfile-keyed cache (policy: pull-push); jobs that need: [install] pull it (policy: pull). Never pass dependencies as artifacts.")
 
     return {
         "label": stack["label"],
@@ -170,7 +170,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=positive_int, default=2, help="Test workers per job (default: 2)")
     parser.add_argument("--shards", type=positive_int, default=1, help="Test parallel shards (default: 1)")
     parser.add_argument("--no-prebuilt", action="store_true", help="Simulate without prebuilt CI image")
-    parser.add_argument("--no-install-once", action="store_true", help="Simulate without install-once artifact passing")
+    parser.add_argument("--no-install-once", action="store_true", help="Simulate without the install-once dependency cache")
 
     args = parser.parse_args(argv)
     result = simulate(
