@@ -26,6 +26,14 @@ default:
   image: $CI_REGISTRY_IMAGE/ci:latest
   interruptible: true
   timeout: 15m
+  cache:                             # Every job reads the dependencies install wrote; none writes
+    key:
+      files:
+        - uv.lock
+    paths:
+      - .uv-cache/
+      - .venv/
+    policy: pull
 
 variables:
   GIT_DEPTH: "20"
@@ -54,6 +62,7 @@ ci-image:
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
   before_script: []
+  cache: []                          # Builds the image: needs no dependencies
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker build -f Dockerfile.ci -t "$CI_REGISTRY_IMAGE/ci:latest" .
@@ -76,12 +85,8 @@ install:
         - uv.lock
     paths:
       - .uv-cache/
-    policy: pull-push
-  artifacts:
-    name: "venv-${CI_COMMIT_REF_SLUG}"
-    paths:
       - .venv/
-    expire_in: 1 hour
+    policy: pull-push                # Only install writes the cache; it uploads no artifacts
 
 # ------------------------------------------------------------------------------
 # Fast parallel jobs using mounted .venv
@@ -128,13 +133,13 @@ build:
     name: "dist-${CI_COMMIT_REF_SLUG}"
     paths:
       - dist/
-    expire_in: 1 day
+    expire_in: 1 hour                # test:e2e needs this exact output; nothing else keeps it
 
 # ------------------------------------------------------------------------------
 # Heavy Integration / E2E
 # ------------------------------------------------------------------------------
-# Played more than an hour after its pipeline started, this needs `install` re-run first:
-# the dependency artifact has expired by then.
+# Played more than an hour after its pipeline started, this needs `build` re-run first:
+# its artifact has expired by then.
 test:e2e:
   stage: e2e
   needs:

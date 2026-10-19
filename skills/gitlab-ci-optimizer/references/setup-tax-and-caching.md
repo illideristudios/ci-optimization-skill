@@ -71,11 +71,11 @@ Running dependency installation in parallel jobs (lint, unit-test, integration-t
 ### The Two-Tier Strategy:
 1. **One dedicated `install` job**:
    - Downloads/resolves dependencies using strict frozen lockfiles.
-   - Saves package manager download cache (`cache:`).
-   - Exports the prepared vendor folder (`node_modules/`, `.venv/`) as a **short-lived pipeline artifact** (`expire_in: 1 hour`).
+   - Writes the download store and the installed tree (`node_modules/`, `.venv/`) to a `cache:` keyed on the lockfile, with `policy: pull-push`.
+   - Uploads **no artifacts**. Vendor folders (`node_modules/`, `.venv/`, `.nuget/`, `obj/`) are never artifacts.
 2. **Downstream jobs (`lint`, `test`, `build`)**:
    - Depend directly on `needs: [install]`.
-   - Start immediately with dependencies already mounted on disk.
+   - Pull the same cache with `policy: pull`, so they start with dependencies on disk and never write the cache.
    - Do **not** run any install commands in `before_script`.
 
 ```yaml
@@ -89,18 +89,21 @@ install:
         - package-lock.json
     paths:
       - .npm/
-    policy: pull-push                # Only the install job writes to the cache
-  artifacts:
-    name: "deps-${CI_COMMIT_REF_SLUG}"
-    paths:
       - node_modules/
-    expire_in: 1 hour                # Prevent filling runner/GitLab disk
-    when: on_success
+    policy: pull-push                # Only the install job writes to the cache; it uploads no artifacts
 
 test:
   stage: test
   needs:
-    - install                        # Automatically downloads node_modules/
+    - install                        # Starts as soon as install has filled the cache
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+      - node_modules/
+    policy: pull                     # Reads node_modules/ from the cache; never writes it
   script:
     - npx jest --maxWorkers=2
 ```
@@ -111,16 +114,31 @@ test:
 
 | Dimension | `cache` | `artifacts` |
 | :--- | :--- | :--- |
-| **Primary Purpose** | Accelerate downloads across pipelines | Pass verified files to downstream jobs in current pipeline |
+| **Primary Purpose** | Carry dependencies to every job, across pipelines | Hand a later job or a person output it cannot rebuild |
 | **Availability Guarantee** | **No**. Cold runners or cache evictions start empty | **Yes**. Guaranteed available to subsequent jobs in pipeline |
 | **Storage Location** | Runner host disk or S3/MinIO bucket | GitLab server / object storage |
-| **Ideal Payload** | Package manager download caches (`.npm`, `.uv-cache`, Go mod cache) | Installed trees (`node_modules`, `.venv`), build output (`dist/`), test reports |
-| **Lifespan** | Long-term (weeks/months) | Ephemeral. Always configure `expire_in` (`1 hour` for deps, `1 day` for builds) |
+| **Ideal Payload** | Download stores and installed trees (`.npm`, `node_modules`, `.uv-cache`, `.venv`, Go mod cache) | The bundle a deploy ships, a report someone reads. Never vendor folders |
+| **Lifespan** | Long-term (weeks/months) | `expire_in: 1 hour`, always |
 | **Optimal Policy** | `policy: pull-push` on install, `policy: pull` downstream | Passed via `needs: [job_name]` |
 
 Keep the project setting "Use separate caches for protected branches" on. With it off, a merge request pipeline can write a cache that a protected-branch pipeline later restores and runs.
 
-Install-once costs an artifact upload plus a download in every consuming job. It wins when installing is slow; with a warm cache and a very large `node_modules/` the transfer can cost more than the install it replaces, so measure before adopting it there.
+Most jobs upload nothing. An artifact exists only when a later job or a person needs that exact output and cannot rebuild it from the cache, and it sets `expire_in: 1 hour`. Uploading `node_modules/` (about 37 MB a run) and `obj/` as artifacts filled one project's GitLab storage to 1.68 GB.
+
+```
+A(j) := job j uploads artifacts to GitLab
+M(j) := a later job or a person needs j's exact output and cannot rebuild it from the cache
+V(j) := j's output is a dependency/vendor folder (node_modules/, .venv/, .nuget/, obj/)
+E(j) := j's artifacts set expire_in: 1 hour
+
+1.  A(j) → M(j)       [Zach, 2026-10-19: "artifacts THAT MUST BE THERE expire after 1 hour"]
+2.  V(j) → ¬M(j)      [the install job's lockfile-keyed cache carries dependencies to every consumer]
+3.  A(j) → E(j)       [Zach, 2026-10-19]
+4.  V(j) → ¬A(j)      [2, then the contrapositive of 1: ¬M(j) → ¬A(j)]
+∴   install jobs upload nothing, and any artifact that does exist expires in 1 hour
+```
+
+The cache has no availability guarantee. A consumer that misses it (a cold runner, an eviction, a runner that cannot see what `install` wrote) starts without dependencies and fails; retrying after `install` refills it. With more than one runner, give them a shared distributed cache (S3, GCS) so every runner sees what `install` wrote.
 
 ---
 

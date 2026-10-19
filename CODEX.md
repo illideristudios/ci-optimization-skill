@@ -19,8 +19,22 @@ Runner containers are small (typically 1GB–4GB RAM, 2 vCPUs). Containers inher
 
 ### 2. Eliminate the 3 Setup Taxes
 - **Image Tax**: Tools baked into `Dockerfile.ci` pushed to `$CI_REGISTRY_IMAGE/ci:latest` in `.pre` stage. No dynamic `apt-get` or curl tool installs in `before_script`.
-- **Install Tax**: One dedicated `install` job with frozen lockfile (`npm ci`, `uv sync --frozen`, `go mod download`). Cache download folders (`.npm/`, `.uv-cache/`) and pass vendor folders forward via artifacts (`expire_in: 1 hour`).
+- **Install Tax**: One dedicated `install` job with frozen lockfile (`npm ci`, `uv sync --frozen`, `go mod download`). It fills a cache keyed on the lockfile with the download folders and the installed tree (`policy: pull-push`); consumers pull it (`policy: pull`). Vendor folders (`node_modules/`, `.venv/`, `.nuget/`, `obj/`) are never artifacts.
+- **Artifacts only where they must exist**: Most jobs upload nothing. An artifact is allowed only when a later job or a person needs that exact output and cannot rebuild it from the cache (the bundle a deploy ships, a readable report), and it sets `expire_in: 1 hour`.
 - **Job Tax**: Downstream jobs (`lint`, `test`, `build`) declare `needs: [install]` to start immediately with dependencies mounted.
+
+```
+A(j) := job j uploads artifacts to GitLab
+M(j) := a later job or a person needs j's exact output and cannot rebuild it from the cache
+V(j) := j's output is a dependency/vendor folder (node_modules/, .venv/, .nuget/, obj/)
+E(j) := j's artifacts set expire_in: 1 hour
+
+1.  A(j) → M(j)       [Zach, 2026-10-19: "artifacts THAT MUST BE THERE expire after 1 hour"]
+2.  V(j) → ¬M(j)      [the install job's lockfile-keyed cache carries dependencies to every consumer]
+3.  A(j) → E(j)       [Zach, 2026-10-19]
+4.  V(j) → ¬A(j)      [2, then the contrapositive of 1: ¬M(j) → ¬A(j)]
+∴   install jobs upload nothing, and any artifact that does exist expires in 1 hour
+```
 
 ### 3. Pipeline Hygiene & Concurrency
 - **One Pipeline per Push**: Always include `workflow: rules:` to prevent duplicate branch and MR pipelines.

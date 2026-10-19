@@ -16,7 +16,7 @@ import sys
 # extends: and include:d files are not resolved. Upgrade to a YAML parser when they matter.
 
 DEFAULT_TIMEOUT_MIN = 15
-ARTIFACT_MAX_MIN = 24 * 60
+ARTIFACT_MAX_MIN = 60
 GIT_DEPTH_MAX = 20
 HEAP_FRACTION = 0.75
 
@@ -59,6 +59,14 @@ def nested(body, key):
     """The lines indented under `key:` in a block."""
     match = re.search(rf"^([ \t]+){key}:[ \t]*\n((?:\1[ \t]+.*\n|\s*\n)*)", body + "\n", re.M)
     return match.group(2) if match else ""
+
+
+def cache_policy(body):
+    """The policy of a block's own cache: ('pull-push' when it names none), or None when it has no cache:."""
+    if not re.search(r"^\s+cache:", body, re.M):
+        return None
+    policy = re.search(r"^\s+policy:\s*['\"]?([\w-]+)", nested(body, "cache"), re.M)
+    return policy.group(1) if policy else "pull-push"
 
 
 def rule_items(body):
@@ -162,10 +170,10 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
 
     expiries = [minutes(value) for value in re.findall(r"^\s+expire_in:(.*)$", text, re.M)]
     artifact_blocks = len(re.findall(r"^\s+artifacts:", text, re.M))
-    check("artifact_expiration", "Every artifacts: block expires within 1 day",
+    check("artifact_expiration", "Every artifacts: block expires within 1 hour",
           None if not artifact_blocks else len(expiries) >= artifact_blocks and all(e is not None and e <= ARTIFACT_MAX_MIN for e in expiries),
-          f"All {artifact_blocks} artifacts: blocks set expire_in <= 1 day.",
-          "Give every artifacts: block an `expire_in` of 1 day or less (`1 hour` for dependencies).")
+          f"All {artifact_blocks} artifacts: blocks set expire_in <= 1 hour.",
+          "Give every artifacts: block `expire_in: 1 hour`, and drop any artifact a later job or a person does not need.")
 
     depth = re.search(r"^\s+GIT_DEPTH:\s*['\"]?(\d+)['\"]?\s*$", blocks.get("variables", ""), re.M)
     check("shallow_clone", f"Shallow git clone (GIT_DEPTH 1-{GIT_DEPTH_MAX})",
@@ -191,15 +199,21 @@ def audit_pipeline(content, ram_mb=2048, max_workers=2):
     installs = [line.strip() for line in text.splitlines() if re.search(INSTALL, line)]
     installers = [name for name, body in jobs.items() if re.search(INSTALL, body)]
     script_jobs = [name for name, body in jobs.items() if re.search(r"^\s+script:", body, re.M)]
+    # Dependencies travel by the runner cache; an install job that uploads artifacts fills GitLab storage.
+    uploaders = [name for name in jobs if (name.startswith("install") or name in installers and len(script_jobs) > 1)
+                 and re.search(r"^\s+artifacts:", jobs[name], re.M)]
     shared = False
     if len(installs) == 1 and len(installers) == 1 and not re.search(r"^\s+parallel:", jobs[installers[0]], re.M):
         producer = re.escape(installers[0])
-        consumed = any(re.search(rf"^\s+needs:.*\b{producer}\b|^\s+- (?:job: )?{producer}\s*$", jobs[name], re.M) for name in script_jobs)
-        shared = len(script_jobs) == 1 or bool(re.search(r"^\s+artifacts:", jobs[installers[0]], re.M) and consumed)
-    check("install_once", "Dependencies installed once and shared (install job, artifacts, needs:)",
-          None if not installs else shared,
-          "One install job; other jobs receive its artifact through needs:.",
-          f"{len(installs)} install commands in jobs {', '.join(installers) or '(none)'}. Keep one unsharded `install` job, export its output as artifacts, and use `needs: [install]` in the jobs that consume it.")
+        consumers = [name for name in script_jobs if re.search(rf"^\s+needs:.*\b{producer}\b|^\s+- (?:job: )?{producer}\s*$", jobs[name], re.M)]
+        fills = cache_policy(jobs[installers[0]]) == "pull-push" and re.search(r"^\s+files:", nested(jobs[installers[0]], "cache"), re.M)
+        pulled = all((cache_policy(jobs[name]) or cache_policy(default)) == "pull" for name in consumers)
+        shared = len(script_jobs) == 1 or bool(fills and consumers and pulled)
+    check("install_once", "Dependencies installed once and shared by cache (install job, cache, needs:)",
+          None if not installs and not uploaders else shared and not uploaders,
+          "One install job fills a lockfile-keyed cache; the jobs that need it pull that cache, and no install job uploads artifacts.",
+          (f"Install jobs upload artifacts: {', '.join(uploaders)}. Dependencies reach other jobs by the cache, never as artifacts. " if uploaders else "")
+          + f"{len(installs)} install commands in jobs {', '.join(installers) or '(none)'}. Keep one unsharded `install` job whose `cache:` is keyed on the lockfile (`key: files:`) with `policy: pull-push`, and give the jobs that `needs: [install]` that cache with `policy: pull`.")
 
     tool_installs = [line.strip() for line in text.splitlines() if re.search(TOOL_INSTALL, line)]
     check("prebuilt_ci_image", "No tool installs at job time (prebuilt CI image)",
