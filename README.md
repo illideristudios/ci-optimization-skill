@@ -30,8 +30,22 @@ Derived from the **[Gauntlet GitLab Primer](https://gitlab-primer.netlify.app/)*
 
 ### 2. Pay the Setup Tax Once
 * **Prebuilt CI Image (Layer 1)**: Keep tools in `Dockerfile.ci` built in `.pre` stage only when the Dockerfile changes on the default branch, pushing to `$CI_REGISTRY_IMAGE/ci:latest`.
-* **Install Once, Sync Everywhere (Layer 2)**: A single `install` job with frozen lockfiles (`npm ci`, `uv sync --frozen`, `go mod download`) caches package manager stores and passes installed vendor directories forward via short-lived artifacts (`expire_in: 1 hour`).
+* **Install Once, Sync Everywhere (Layer 2)**: A single `install` job with frozen lockfiles (`npm ci`, `uv sync --frozen`, `go mod download`) fills a cache keyed on the lockfile (`policy: pull-push`), and the jobs that need it pull that cache (`policy: pull`). Vendor folders (`node_modules/`, `.venv/`, `.nuget/`, `obj/`) are never artifacts.
+* **Artifacts only where they must exist**: Most jobs upload nothing. An artifact is allowed only when a later job or a person needs that exact output and cannot rebuild it from the cache (the bundle a deploy ships, a readable report), and it sets `expire_in: 1 hour`.
 * **DAG Execution with `needs:` (Layer 3)**: Downstream jobs (`lint`, `test`, `build`) declare `needs: [install]` to start immediately with dependencies already mounted on disk.
+
+```
+A(j) := job j uploads artifacts to GitLab
+M(j) := a later job or a person needs j's exact output and cannot rebuild it from the cache
+V(j) := j's output is a dependency/vendor folder (node_modules/, .venv/, .nuget/, obj/)
+E(j) := j's artifacts set expire_in: 1 hour
+
+1.  A(j) → M(j)       [Zach, 2026-10-19: "artifacts THAT MUST BE THERE expire after 1 hour"]
+2.  V(j) → ¬M(j)      [the install job's lockfile-keyed cache carries dependencies to every consumer]
+3.  A(j) → E(j)       [Zach, 2026-10-19]
+4.  V(j) → ¬A(j)      [2, then the contrapositive of 1: ¬M(j) → ¬A(j)]
+∴   install jobs upload nothing, and any artifact that does exist expires in 1 hour
+```
 
 ### 3. Pipeline Hygiene & Concurrency Tuning
 * **One Pipeline per Push**: Enforce top-level `workflow: rules:` to prioritize MR pipelines and eliminate duplicate branch runs.
@@ -96,11 +110,11 @@ The checks:
 1. One pipeline per push (`workflow: rules`)
 2. Stale pipelines cancel (`default: interruptible: true`)
 3. Default job timeout <= 15m
-4. Every `artifacts:` block expires within 1 day
+4. Every `artifacts:` block expires within 1 hour
 5. Shallow git clone (`GIT_DEPTH` 1-20)
 6. Test workers capped to runner vCPUs (`--maxWorkers`, `-n`, `-p`, `--workers`)
 7. Runtime heap ceiling, summed over a job's processes, <= 75% of runner RAM (`NODE_OPTIONS`, `GOMEMLIMIT`)
-8. Dependencies installed once and shared (one `install` job, artifacts, `needs:`)
+8. Dependencies installed once and shared by cache: one `install` job fills a lockfile-keyed cache (`pull-push`), the jobs that `needs:` it pull it (`pull`), and no install job uploads artifacts
 9. No tool installs at job time (prebuilt CI image)
 10. Every test or trigger job on the push path skips untouched code (`rules: changes:`)
 11. E2E and security scans off the push path (`schedule` or `manual`)

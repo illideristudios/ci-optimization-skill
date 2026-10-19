@@ -3,9 +3,9 @@ name: gitlab-ci-optimizer
 description: >-
   Use when creating, editing, reviewing, or debugging a GitLab CI/CD pipeline (.gitlab-ci.yml or
   Dockerfile.ci), or when a CI job fails with exit 137, "Killed", or heap out of memory. Covers
-  worker and heap caps sized to the runner, the prebuilt CI image, install-once artifacts, DAG
-  dependencies (needs), duplicate merge request pipelines (workflow:rules), artifact expiry, and
-  test sharding with parallel. Not for GitHub Actions or other CI systems.
+  worker and heap caps sized to the runner, the prebuilt CI image, the install-once dependency
+  cache, DAG dependencies (needs), duplicate merge request pipelines (workflow:rules), artifact
+  expiry, and test sharding with parallel. Not for GitHub Actions or other CI systems.
 ---
 
 # GitLab CI Pipeline Optimizer
@@ -38,7 +38,7 @@ Every CI job pays up to three setup taxes before executing real work:
 * **Image Tax (Tools)**: Downloading bloated base images and installing OS packages (`apt-get`, `curl`, `jq`).
   * *Fix*: Bake tools into a minimal `Dockerfile.ci` pushed to `$CI_REGISTRY_IMAGE/ci:latest` in `.pre`.
 * **Install Tax (Dependencies)**: Resolving and downloading packages (`node_modules/`, `.venv/`, `.go/pkg/mod/`).
-  * *Fix*: **Install once, sync everywhere**. Run a single `install` job with lockfile caching, pass dependencies downstream via ephemeral artifacts (`expire_in: 1 hour`), and declare `needs: [install]`.
+  * *Fix*: **Install once, sync everywhere**. Run a single `install` job that fills a lockfile-keyed cache, have downstream jobs pull that cache and declare `needs: [install]`. Dependencies never travel as artifacts.
 * **Job Tax (Your Code)**: Linting, compiling, and testing. This is the **only** tax you should pay on each push.
 
 ### 2. The Six Memory & Runner Survival Rules
@@ -51,7 +51,7 @@ Most pipeline failures on 1GB–4GB runner containers are not code bugs—they a
    * Go, `go test -p 2` (2 test binaries): `GOMEMLIMIT="768MiB"` with `GOMAXPROCS="2"`. The limit is soft.
    * JVM: `-XX:MaxRAMPercentage=75`.
    * CPython has no heap cap. `MALLOC_ARENA_MAX="2"` limits glibc fragmentation; the worker cap is what bounds memory.
-4. **One Heavy Thing per Job**: Do not build, boot databases, and run full E2E suites inside a single job. Decouple jobs and pass artifacts forward using `needs:`.
+4. **One Heavy Thing per Job**: Do not build, boot databases, and run full E2E suites inside a single job. Decouple jobs and order them with `needs:`; an artifact passes forward only output a later job cannot rebuild.
 5. **Shard Anything Over ~8–10 Minutes**: Use `parallel: N` (e.g. `parallel: 2` or `4`). Split suites with Jest `--shard`, `pytest-split`, or Go package partitioning. **Always ensure `shards <= concurrent_runner_slots`** to prevent queuing in waves.
 6. **Don't Run What Didn't Change**: Use `rules: changes:` on lint and unit test jobs to skip execution when files outside that domain are modified.
 
@@ -87,8 +87,22 @@ In the root `.gitlab-ci.yml`:
 Replace per-job `npm install` / `pip install` / `go mod download` with a dedicated `install` job:
 * Key the cache strictly to the lockfile (`package-lock.json`, `uv.lock`, `go.sum`).
 * Restrict cache write permissions: `policy: pull-push` on the install job, `policy: pull` on downstream consumer jobs.
-* Export vendor directory as an artifact with `expire_in: 1 hour`.
-* Downstream jobs (`lint`, `test`, `build`) declare `needs: [install]` to mount dependencies immediately.
+* Cache the installed tree with the download store (`node_modules/`, `.venv/`, `.go/pkg/mod/`). The cache is how dependencies reach downstream jobs; vendor folders (`node_modules/`, `.venv/`, `.nuget/`, `obj/`) are never artifacts.
+* Downstream jobs (`lint`, `test`, `build`) declare `needs: [install]` and pull the cache. Setting it under `default:` with `policy: pull` and overriding it in `install` with `policy: pull-push` covers every job, as the examples do.
+* Upload an artifact only when a later job or a person needs that exact output and cannot rebuild it from the cache: the bundle a deploy ships, a report someone reads. Every such artifact sets `expire_in: 1 hour`. Most jobs upload nothing.
+
+```
+A(j) := job j uploads artifacts to GitLab
+M(j) := a later job or a person needs j's exact output and cannot rebuild it from the cache
+V(j) := j's output is a dependency/vendor folder (node_modules/, .venv/, .nuget/, obj/)
+E(j) := j's artifacts set expire_in: 1 hour
+
+1.  A(j) → M(j)       [Zach, 2026-10-19: "artifacts THAT MUST BE THERE expire after 1 hour"]
+2.  V(j) → ¬M(j)      [the install job's lockfile-keyed cache carries dependencies to every consumer]
+3.  A(j) → E(j)       [Zach, 2026-10-19]
+4.  V(j) → ¬A(j)      [2, then the contrapositive of 1: ¬M(j) → ¬A(j)]
+∴   install jobs upload nothing, and any artifact that does exist expires in 1 hour
+```
 
 ### Step 4: Tune Memory & Prevent OOM (Exit 137)
 * Ensure test runner workers match runner vCPUs (typically 2).
