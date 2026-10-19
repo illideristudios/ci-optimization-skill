@@ -45,7 +45,14 @@ Derived from the **[Gauntlet GitLab Primer](https://gitlab-primer.netlify.app/)*
 
 ## 📦 Install
 
-The scripts need Python 3 and nothing else. Every agent file refers to the skill at `.agents/skills/gitlab-ci-optimizer/`, so copy `skills/` there in the project whose pipeline you are working on:
+**Claude Code** installs both skills as a plugin, from GitHub or from a local checkout:
+
+```bash
+/plugin install gitlab-ci-optimizer --marketplace locriani/ci-optimization-skill
+# or: claude plugin marketplace add ~/path/to/ci-optimization-skill && claude plugin install gitlab-ci-optimizer@gitlab-ci-optimizer
+```
+
+**Other agents**: the scripts need Python 3 and nothing else. Every agent file refers to the skill at `.agents/skills/gitlab-ci-optimizer/`, so copy `skills/` there in the project whose pipeline you are working on:
 
 ```bash
 git clone https://github.com/locriani/ci-optimization-skill

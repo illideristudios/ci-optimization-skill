@@ -1,0 +1,16 @@
+{
+  "name": "gitlab-ci-optimizer",
+  "description": "GitLab CI runner budgeting: an 11-point pipeline auditor, a memory and concurrency simulator, and the rules that prevent exit 137 OOM kills.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Zach Gardner",
+    "email": "locriani@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "gitlab",
+    "ci",
+    "oom",
+    "pipeline"
+  ]
+}
